@@ -1,0 +1,4 @@
+# Python deps for a local install (scripts/install-local.sh): the cli backend and the
+# mirror. The api backend also needs anthropic (see requirements.txt).
+python-frontmatter==1.1.0
+PyYAML==6.0.3

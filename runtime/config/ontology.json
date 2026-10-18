@@ -1,0 +1,51 @@
+{
+  "schema": "engram.ontology.v1",
+  "version": "1.0.0",
+  "entity_types": [
+    "person",
+    "project",
+    "host",
+    "service",
+    "software",
+    "organization",
+    "place",
+    "document",
+    "concept"
+  ],
+  "memory_kinds": [
+    "user",
+    "feedback",
+    "project",
+    "reference"
+  ],
+  "relevance": {
+    "binary_yes": [
+      "answers",
+      "constrains",
+      "conflicts"
+    ],
+    "labels": [
+      "answers",
+      "constrains",
+      "conflicts",
+      "background",
+      "unrelated"
+    ],
+    "note": "background counts as yes only when it would change the reply"
+  },
+  "thresholds": {
+    "bigram_ubiquity": 0.5,
+    "concentration": "per-document rate",
+    "max_terms": 200,
+    "min_concentration": 0.85,
+    "min_df": 3,
+    "shared_max_concentration": 0.5,
+    "shared_min_df": 4,
+    "unigram_dictionary_excluded": true
+  },
+  "generated_by": "scripts/export-install-repo.py (no projects)",
+  "canonical_topics": [],
+  "project_slugs": [],
+  "shared_words": [],
+  "memory_projects_sha256": "29dd4275909fb8e820d57166aff8e6c5289ba142c00faa87deec926add039fdd"
+}
