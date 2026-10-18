@@ -6,7 +6,10 @@ preferences, gotchas), and brings the relevant notes back into later sessions in
 either app. The memory is plain Markdown in `~/Engram/vault`. You can read it,
 edit it, or open it in Obsidian.
 
-It runs on your own Claude or Codex login. It sends nothing anywhere else.
+It runs on your own Claude or Codex login. It sends nothing anywhere else. Each
+session it reads is one request on that login, so it starts with your last 7 days of
+sessions, not your whole history. Change `ENGRAM_SINCE_DAYS` in
+`~/.config/engram/engram.env` to reach further back (empty means everything).
 
 ## What you need
 

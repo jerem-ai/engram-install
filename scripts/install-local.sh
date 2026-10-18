@@ -207,6 +207,7 @@ ENGRAM_PERSONA=$principal
 ENGRAM_NOTIFY=$CURRENT/scripts/engram-notify-local.sh
 ENGRAM_LABEL_PREFIX=$PREFIX
 ENGRAM_MCP_ADMISSION=legacy
+ENGRAM_SINCE_DAYS=7
 CODEX_HOME=$CODEX_DIR
 ENV
   if [ -f "$CONF/tenant.env" ]; then

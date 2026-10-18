@@ -69,6 +69,12 @@ NUM_CTX="${ENGRAM_NUM_CTX:-131072}"   # 32768 silently drops the system prompt o
 # All four PRODUCT_SPEC adapters (2026-08-12). Adapters whose source dirs are
 # absent on this machine no-op, so one value serves laptop and mini.
 RUNTIMES="${ENGRAM_RUNTIMES:-claude-code,codex,hermes,openclaw}"
+# Only sessions written in the last N days. Installs set 7 so the first run does not mine
+# a month of history on the user's subscription in one hour; empty means every session.
+SINCE_DAYS="${ENGRAM_SINCE_DAYS:-${ENGRAM_CONF_ENGRAM_SINCE_DAYS:-}}"
+case "$SINCE_DAYS" in
+  ""|*[!0-9]*) [ -z "$SINCE_DAYS" ] || { echo "[$(date '+%F %T')] ERROR: ENGRAM_SINCE_DAYS must be a whole number of days, got: $SINCE_DAYS" >&2; exit 64; } ;;
+esac
 if [ "$BACKEND" = "ollama" ]; then
   MODEL="${ENGRAM_MODEL:-qwen3.6:27b}"
 elif [ "$BACKEND" = "cli" ] || [ "$BACKEND" = "api" ]; then
@@ -177,13 +183,13 @@ fi
 
 if [ "$BACKEND" = "ollama" ]; then
   echo "[$(date '+%F %T')] memory-extraction start (backend=ollama model=$MODEL num_ctx=$NUM_CTX)"
-  "$PY" "$EXTRACT" --backend ollama --ollama-url "$OLLAMA_URL" --model "$MODEL" --num-ctx "$NUM_CTX" --runtimes "$RUNTIMES"
+  "$PY" "$EXTRACT" --backend ollama --ollama-url "$OLLAMA_URL" --model "$MODEL" --num-ctx "$NUM_CTX" --runtimes "$RUNTIMES" ${SINCE_DAYS:+--since-days "$SINCE_DAYS"}
 elif [ "$BACKEND" = "cli" ] || [ "$BACKEND" = "api" ]; then
   # The user's own subscription (cli: their logged-in claude or codex, chosen by
   # ENGRAM_CLI_DRIVER) or their Anthropic key (api). The extractor preflights the cli
   # driver and exits 5 before any write when it cannot answer. No fallback.
   echo "[$(date '+%F %T')] memory-extraction start (backend=$BACKEND${MODEL:+ model=$MODEL})"
-  "$PY" "$EXTRACT" --backend "$BACKEND" ${MODEL:+--model "$MODEL"} --runtimes "$RUNTIMES"
+  "$PY" "$EXTRACT" --backend "$BACKEND" ${MODEL:+--model "$MODEL"} --runtimes "$RUNTIMES" ${SINCE_DAYS:+--since-days "$SINCE_DAYS"}
 else
   operator_lane_extract
 fi
