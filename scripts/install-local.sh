@@ -91,19 +91,35 @@ use_launchd() {
 # --- prerequisites --------------------------------------------------------------
 
 [ "$(uname -s)" = Darwin ] || die 3 "macOS only for now."
+# A shell started before Homebrew was installed does not have it on PATH, so look in
+# Homebrew's prefixes directly. node@22 is keg-only: use its own path rather than
+# linking it over another Node the user may have.
+BREW_INSTALL='/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+BREW=""
+for prefix in ${ENGRAM_BREW_PREFIXES:-/opt/homebrew /usr/local}; do
+  [ -x "$prefix/bin/brew" ] && [ -z "$BREW" ] && BREW="$prefix/bin/brew"
+  [ -d "$prefix/bin" ] && case ":$PATH:" in *":$prefix/bin:"*) ;; *) PATH="$PATH:$prefix/bin" ;; esac
+done
+[ -n "$BREW" ] || BREW="$(command -v brew || true)"
+is_node22() { case "$("$1" --version 2>/dev/null || true)" in v22.*) return 0 ;; *) return 1 ;; esac; }
 NODE="${ENGRAM_NODE:-$(command -v node || true)}"
+if [ -z "${ENGRAM_NODE:-}" ] && ! is_node22 "$NODE"; then
+  for prefix in ${ENGRAM_BREW_PREFIXES:-/opt/homebrew /usr/local}; do
+    is_node22 "$prefix/opt/node@22/bin/node" && { NODE="$prefix/opt/node@22/bin/node"; break; }
+  done
+fi
 PY312="$(command -v python3.12 || true)"
-[ -n "$PY312" ] || { [ -x /opt/homebrew/bin/python3.12 ] && PY312=/opt/homebrew/bin/python3.12; } || true
 CLAUDE_BIN="$(command -v claude || true)"
 CODEX_BIN="$(command -v codex || true)"
 
 if [ "$MODE" = install ]; then
-  case "$("$NODE" --version 2>/dev/null || true)" in
-    v22.*) ;;
-    *) die 3 "Node 22 is required (found: ${NODE:-none}). Install it with: brew install node@22 && brew link --overwrite node@22" ;;
-  esac
-  [ -n "$PY312" ] || die 3 "Python 3.12 is required. Install it with: brew install python@3.12"
-  command -v git >/dev/null || die 3 "git is required. Install it with: xcode-select --install"
+  if [ -z "$BREW" ] && { ! is_node22 "$NODE" || [ -z "$PY312" ]; }; then
+    die 3 "Homebrew is required. Open the Terminal app, paste this line, press Return and enter your Mac password when asked: $BREW_INSTALL  Then run this installer again."
+  fi
+  is_node22 "$NODE" || die 3 "Node 22 is required (found: ${NODE:-none}). Install it with: $BREW install node@22"
+  [ -n "$PY312" ] || die 3 "Python 3.12 is required. Install it with: $BREW install python@3.12"
+  # /usr/bin/git exists before the developer tools do; it only works once they are installed.
+  git --version >/dev/null 2>&1 || die 3 "git is required. Install it with: xcode-select --install"
   claude_ok=0; codex_ok=0
   # ENGRAM_CLI_HOME names the home whose CLI logins to use (the extractor honors it
   # too); a test install under a throwaway HOME points it at the real one.

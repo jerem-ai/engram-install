@@ -16,24 +16,33 @@ sessions, not your whole history. Change `ENGRAM_SINCE_DAYS` in
 - A Mac.
 - Claude Code, logged in (run `claude`, then type `/login`). Codex works too, but
   Engram learns less from it today.
-- Node 22, Python 3.12 and git. If one is missing, the installer stops and prints the
-  Homebrew command for it.
+- Node 22, Python 3.12 and git. You don't need them yet: your agent installs them with
+  Homebrew. If Homebrew isn't on your Mac, your agent gives you one line to paste into
+  the Terminal app, because installing it asks for your Mac password.
 
 ## Paste this into Claude Code (or Codex)
 
 ```text
 Install Engram for me from GitHub and check that it works:
 
-1. Run: git clone https://github.com/jerem-ai/engram-install.git ~/Engram/src
-2. Run: ~/Engram/src/scripts/install-local.sh
-   If it stops because Node 22, Python 3.12 or git is missing, run the brew command it
-   prints, then run the installer again. If it says Claude Code is not logged in, tell
-   me to log in and stop.
-3. Run: ~/Engram/current/scripts/engram-status.sh
+1. Check for Homebrew: ls /opt/homebrew/bin/brew /usr/local/bin/brew
+   If neither exists, stop and tell me to open the Terminal app, paste this line, press
+   Return and type my Mac password when it asks (the screen shows nothing as I type):
+     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   Tell me to come back and say "done" when it finishes. Then check again.
+2. Install the tools with the brew that exists, by its full path (it may not be on
+   PATH yet): <full path to brew> install git node@22 python@3.12
+3. Run, with the git from that same Homebrew folder:
+   <Homebrew folder>/bin/git clone https://github.com/jerem-ai/engram-install.git ~/Engram/src
+4. Run: ~/Engram/src/scripts/install-local.sh
+   If it stops and prints a command to install something, run that command, then run
+   the installer again. If it says Claude Code is not logged in, tell me to log in and
+   stop.
+5. Run: ~/Engram/current/scripts/engram-status.sh
    Show me its output. A brand-new install shows "extraction has not run yet" and no
    memories; that is expected. Anything marked FIX that is not about extraction or
    memories is a problem: show me its fix line.
-4. Tell me to quit and reopen Claude Code (and Codex, if I use it) so the Engram tools
+6. Tell me to quit and reopen Claude Code (and Codex, if I use it) so the Engram tools
    and recall hook load.
 
 Do not change any other settings.
