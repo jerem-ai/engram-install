@@ -4,6 +4,7 @@ import { queryAssertions, getAssertion } from './assertions.js';
 import { queryEpisodes, getEpisode } from './episodes.js';
 import type { EngramAssertion } from './assertions.js';
 import { isPromotedMemorySource, MEMORY_AUTHORITY } from './admission.js';
+import { buildProvenance, parseFrontmatter as parseNodeFrontmatter, type Provenance, type ProvenanceOptions } from './provenance.js';
 
 // --- Types (matching ENGRAM.md recall contract) ---
 
@@ -983,12 +984,13 @@ export interface ExplainResult {
   whyConfidence: string;
   alternatives: string[];
   citationExcerpt: string | null;
+  provenance: Provenance;
 }
 
 export function engramExplain(
   db: Database.Database,
   assertionId: string,
-  opts: { admission?: 'legacy' | 'promoted_only' } = {},
+  opts: { admission?: 'legacy' | 'promoted_only'; provenance?: ProvenanceOptions } = {},
 ): ExplainResult | { error: string } {
   const assertion = getAssertion(db, assertionId);
   if (!assertion || (opts.admission === 'promoted_only'
@@ -1016,12 +1018,15 @@ export function engramExplain(
     .map(a => `  - ${a.id}: "${a.subject} ${a.predicate} ${a.object}" (confidence: ${a.confidence}, status: ${a.status})`);
 
   let citationExcerpt: string | null = null;
+  let frontmatter: string | null = null;
   try {
-    const node = db.prepare('SELECT content FROM nodes WHERE id = ?').get(assertion.source_node_id) as { content: string } | undefined;
+    const node = db.prepare('SELECT content, frontmatter FROM nodes WHERE id = ?').get(assertion.source_node_id) as { content: string | null; frontmatter: string | null } | undefined;
     if (node) {
-      citationExcerpt = node.content.slice(0, 300).replace(/\n/g, ' ').trim();
+      citationExcerpt = (node.content ?? '').slice(0, 300).replace(/\n/g, ' ').trim();
+      frontmatter = node.frontmatter;
     }
   } catch {}
+  const provenance = buildProvenance(parseNodeFrontmatter(frontmatter), assertion, opts.provenance);
 
   return {
     assertionId: assertion.id,
@@ -1036,5 +1041,6 @@ export function engramExplain(
     whyConfidence: whyConfidenceLines.join('; '),
     alternatives: alternatives.length > 0 ? alternatives : ['No alternatives found'],
     citationExcerpt,
+    provenance,
   };
 }

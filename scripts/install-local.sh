@@ -1,7 +1,8 @@
 #!/bin/bash
 # install-local.sh: install Engram for one macOS user (PLAN_ENGRAM_OUT_OF_BOX_2026-10-17.md, Phase 4).
 #
-#   scripts/install-local.sh [--dry-run] [--driver claude|codex] [--port N] [--no-launchd]
+#   scripts/install-local.sh [--dry-run] [--driver claude|codex] [--port N] [--no-launchd] [--no-archive]
+#   scripts/install-local.sh --delete-archive [--dry-run]
 #   scripts/install-local.sh --uninstall [--dry-run]
 #   scripts/install-local.sh --purge [--dry-run]
 #
@@ -11,6 +12,12 @@
 # user's own claude or codex login, and a resident kg-http on 127.0.0.1), registers
 # the Engram MCP server with Claude Code and Codex, and installs both recall hooks.
 # Run it again to upgrade; it is idempotent.
+#
+# The hourly job also keeps a compressed, add-only copy of every Claude Code and
+# Codex transcript in ~/Engram/archive (owner-only), because Claude Code deletes
+# them after about 30 days and a memory's source log would go with them.
+# --no-archive installs without it (engram.env ENGRAM_ARCHIVE_DIR=off; a reinstall
+# keeps that choice). --delete-archive turns it off and deletes ~/Engram/archive.
 #
 # Every path comes from HOME, CLAUDE_CONFIG_DIR, CODEX_HOME and
 # ENGRAM_LAUNCH_AGENTS_DIR, so a throwaway HOME isolates a test install completely.
@@ -28,6 +35,7 @@ DRY=0
 DRIVER=""
 PORT="${ENGRAM_HTTP_PORT:-3741}"
 LAUNCHD=auto
+ARCHIVE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
@@ -36,7 +44,9 @@ while [ $# -gt 0 ]; do
     --driver) DRIVER="${2:-}"; shift ;;
     --port) PORT="${2:-}"; shift ;;
     --no-launchd) LAUNCHD=no ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    --no-archive) ARCHIVE=off ;;
+    --delete-archive) MODE=delete-archive ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "install-local: unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -49,6 +59,7 @@ DATA="$ENGRAM_HOME/data"
 LOGS="$ENGRAM_HOME/logs"
 STATE="$ENGRAM_HOME/state/extraction"
 RELEASES="$ENGRAM_HOME/releases"
+ARCHIVE_DIR="$ENGRAM_HOME/archive"
 CURRENT="$ENGRAM_HOME/current"
 CONF="$HOME/.config/engram"
 MANIFEST="$CONF/install-manifest.json"
@@ -202,9 +213,14 @@ flip_current() {
 }
 
 write_config() {
-  local principal name
+  local principal name archive
   principal=$(identifier "$(id -un)")
   name=$(id -F 2>/dev/null || id -un)
+  # An earlier opt-out (ENGRAM_ARCHIVE_DIR=off) survives a reinstall.
+  archive=$ARCHIVE_DIR
+  if [ "$ARCHIVE" = off ] || [ "$(sed -n 's/^ENGRAM_ARCHIVE_DIR=//p' "$CONF/engram.env" 2>/dev/null)" = off ]; then
+    archive=off
+  fi
   write_file "$CONF/engram.env" 600 <<ENV
 # Written by Engram's scripts/install-local.sh. Re-running the installer rewrites it.
 ENGRAM_HOME=$ENGRAM_HOME
@@ -224,6 +240,7 @@ ENGRAM_NOTIFY=$CURRENT/scripts/engram-notify-local.sh
 ENGRAM_LABEL_PREFIX=$PREFIX
 ENGRAM_MCP_ADMISSION=legacy
 ENGRAM_SINCE_DAYS=7
+ENGRAM_ARCHIVE_DIR=$archive
 CODEX_HOME=$CODEX_DIR
 ENV
   if [ -f "$CONF/tenant.env" ]; then
@@ -406,6 +423,19 @@ uninstall() {
   remove "$ENGRAM_HOME/previous"
 }
 
+delete_archive() {
+  if [ -f "$CONF/engram.env" ]; then
+    if [ "$DRY" -eq 1 ]; then
+      say "[dry-run] set ENGRAM_ARCHIVE_DIR=off in $CONF/engram.env"
+    else
+      sed 's/^ENGRAM_ARCHIVE_DIR=.*/ENGRAM_ARCHIVE_DIR=off/' "$CONF/engram.env" | write_file "$CONF/engram.env" 600
+      grep -q '^ENGRAM_ARCHIVE_DIR=off$' "$CONF/engram.env" \
+        || printf 'ENGRAM_ARCHIVE_DIR=off\n' >> "$CONF/engram.env"
+    fi
+  fi
+  remove "$ARCHIVE_DIR"
+}
+
 purge() {
   local created_claude created_codex created_la
   created_claude=$(manifest_flag created_claude_dir)
@@ -438,4 +468,5 @@ case "$MODE" in
   install) install ;;
   uninstall) uninstall; say "uninstalled; kept $VAULT, $DATA and $CONF (use --purge to remove them)" ;;
   purge) purge; say "purged" ;;
+  delete-archive) delete_archive; say "transcript archive off and deleted; reinstall without --no-archive to turn it back on" ;;
 esac

@@ -58,6 +58,7 @@ Do not change any other settings.
 | Settings | `~/.config/engram/engram.env` and `tenant.env` |
 | Background jobs | `~/Library/LaunchAgents/com.engram.local.*`: learn from sessions hourly, copy notes into the vault and index them every 15 minutes, and a small search server on 127.0.0.1 |
 | Claude Code and Codex | an `engram` MCP server (`engram_recall`, `engram_remember` and three read tools) and a recall hook that adds relevant notes to each prompt |
+| Copies of your sessions | `~/Engram/archive`: a compressed copy of each Claude Code and Codex session, so a note can still show where it came from after Claude Code deletes old sessions (about 30 days) |
 | Logs | `~/Engram/logs` |
 
 ## Check on it
@@ -67,6 +68,21 @@ Do not change any other settings.
 ```
 
 Each line is OK, WARN or FIX, and every FIX line says what to run.
+
+## Session copies
+
+Every hour Engram copies new Claude Code and Codex sessions (including ChatGPT
+desktop Work threads, which Codex writes) into `~/Engram/archive`. Only your user
+account can read it. It only adds: a session Claude Code deletes stays in the copy.
+`engram-status.sh` ends with a line showing its size.
+
+To stop copying, install with `--no-archive`, or set `ENGRAM_ARCHIVE_DIR=off` in
+`~/.config/engram/engram.env`. An update keeps that choice. To stop copying and delete
+the copies:
+
+```bash
+~/Engram/src/scripts/install-local.sh --delete-archive
+```
 
 ## Update
 

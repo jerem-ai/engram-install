@@ -82,6 +82,14 @@ elif [ "$BACKEND" = "cli" ] || [ "$BACKEND" = "api" ]; then
 else
   MODEL="${ENGRAM_MODEL:-$OPERATOR_LANE_MODEL}"
 fi
+# Local transcript archive (installs only): engram.env ENGRAM_ARCHIVE_DIR, `off` to
+# disable. Runs every hour, before the off-hours gate, so the copy never waits on
+# extraction. Unset on Jeremy's machines, whose transcripts go to the NAS instead.
+ARCHIVE_DIR="${ENGRAM_ARCHIVE_DIR:-${ENGRAM_CONF_ENGRAM_ARCHIVE_DIR:-}}"
+if [ -n "$ARCHIVE_DIR" ] && [ "$ARCHIVE_DIR" != off ]; then
+  "${ENGRAM_PY:-$SCRIPT_DIR/venv/bin/python}" "$SCRIPT_DIR/archive_local.py" --archive "$ARCHIVE_DIR"
+fi
+
 OFF_HOURS_START=${ENGRAM_OFF_START:-3}
 OFF_HOURS_END=${ENGRAM_OFF_END:-6}    # exclusive; 3..5 inclusive
 MAX_STALE_HOURS=${ENGRAM_MAX_STALE:-26}
