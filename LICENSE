@@ -1,6 +1,8 @@
 MIT License
 
 Copyright (c) 2026 jerem-ai
+Copyright (c) 2026 Jesse Vincent (the vault index, link parsing and graph code
+descend from https://github.com/obra/knowledge-graph, released under the MIT License)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

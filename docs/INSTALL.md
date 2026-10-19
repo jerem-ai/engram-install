@@ -84,3 +84,9 @@ The previous version stays in `~/Engram/previous`.
 ```
 
 Add `--dry-run` to either to see what it would do first.
+
+## Credits
+
+Engram began as a fork of Jesse Vincent's
+[knowledge-graph](https://github.com/obra/knowledge-graph) (MIT). Its vault index,
+link parsing and graph queries still descend from that code.

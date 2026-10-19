@@ -32,7 +32,7 @@ export function loadCorpusRegistry(path: string): CorpusRegistryCollection[] {
       || !isAbsolute(row.database_path) || seen.has(row.id)
       || !Number.isFinite(row.freshness_seconds) || row.freshness_seconds < 60
       || typeof row.enabled !== 'boolean'
-      || !['json_catalog', 'shopify_products', 'tiktok_profile', 'gx460_forum', 'evidence_snapshot', 'bambu_wiki', 'web_documents'].includes(row.adapter)
+      || !['json_catalog', 'shopify_products', 'tiktok_profile', 'gx460_forum', 'evidence_snapshot', 'bambu_wiki', 'web_documents', 'reddit_subreddit'].includes(row.adapter)
       || (row.last_success_at !== null && !Number.isFinite(Date.parse(row.last_success_at)))) {
       throw new Error('Invalid corpus registration');
     }
