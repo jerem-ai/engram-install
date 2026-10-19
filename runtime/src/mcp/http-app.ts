@@ -215,7 +215,7 @@ export function createKgHttpApp(options: KgHttpAppOptions): KgHttpApp {
     const sse = sseSessions.stats();
     res.json({
       status: 'ok',
-      server: 'knowledge-graph',
+      server: 'engram',
       transports: { streamableHttp: '/mcp', sse: '/sse' },
       sessions: {
         streamable: streamable.active,

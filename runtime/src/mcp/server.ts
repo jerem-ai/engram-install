@@ -156,7 +156,7 @@ export interface KgServerOptions {
 
 export function createKgServer(options: KgServerOptions = {}): McpServer {
   const server = new McpServer({
-    name: 'knowledge-graph',
+    name: 'engram',
     version: '0.1.0',
   });
   registerHistorySearchTool(

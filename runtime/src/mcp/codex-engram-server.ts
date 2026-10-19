@@ -61,7 +61,7 @@ export interface CodexEngramServerOptions {
 export function createCodexEngramServer(options: CodexEngramServerOptions): McpServer {
   const store = new Store(options.dbPath, options.accessContext);
   const writer = options.candidateWriter ?? new VaultWriter(options.vaultPath, store);
-  const server = new McpServer({ name: 'knowledge-graph', version: '1.0.0' });
+  const server = new McpServer({ name: 'engram', version: '1.0.0' });
   const admission = options.readAdmission ?? 'promoted_only';
   server.server.onclose = () => {
     if (store.db.open) store.close();
