@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -33,11 +34,13 @@ export interface Provenance {
   /** source_session without its runtime prefix, as transcript files are named. */
   sessionKey: string | null;
   runtime: string | null;
-  /** Quoted passages for this assertion, or the note's passages when the assertion has none. */
+  /** Quoted passages for this assertion, the note's, or a supported fact link's. */
   passages: string[];
-  passagesScope: 'assertion' | 'note' | 'none';
+  passagesScope: 'assertion' | 'note' | 'link' | 'none';
   support: { verdict: string | null; check: string | null };
   transcript: TranscriptLocation;
+  /** The nightly linker's result for an engram_remember fact (extraction/link_facts.py). */
+  link?: { support: string; summaryOnly: boolean; linkedAt: string | null; judge: string | null };
 }
 
 export interface ProvenanceOptions {
@@ -47,12 +50,38 @@ export interface ProvenanceOptions {
   detail?: 'full' | 'redacted';
 }
 
-interface AssertionTriple { subject: string; predicate: string; object: string }
+interface AssertionTriple { subject: string; predicate: string; object: string; source_node_id?: string }
 
 type Json = Record<string, unknown>;
 
 const RUNTIME_PREFIX = /^(codex|claude|claude-code|hermes|openclaw):/;
 const SAFE_KEY = /^[A-Za-z0-9._-]+$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function factLinksPath(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  return env.ENGRAM_FACT_LINKS ?? join(home, '.local/share/engram/fact-links.jsonl');
+}
+
+/** Same key as extraction/link_facts.py link_key(). */
+export function factLinkKey(sourceNodeId: string, a: AssertionTriple): string {
+  const n = (v: string) => v.trim().toLowerCase().replace(/\s+/g, ' ');
+  return createHash('sha256').update([sourceNodeId, n(a.subject), n(a.predicate), n(a.object)].join('\0'))
+    .digest('hex').slice(0, 32);
+}
+
+/** The latest fact-link record for this assertion, or null. */
+export function findFactLink(path: string, key: string): Json | null {
+  if (!existsSync(path)) return null;
+  let found: Json | null = null;
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
+    if (!line.includes(key)) continue;
+    try {
+      const rec = JSON.parse(line) as Json;
+      if (rec.schema === 'engram.fact-link.v1' && rec.key === key) found = rec;
+    } catch {}
+  }
+  return found;
+}
 
 export function transcriptIndexPath(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
   return env.ENGRAM_TRANSCRIPT_INDEX ?? join(home, '.local/share/engram/transcript-index.tsv');
@@ -118,6 +147,15 @@ export function findLocalTranscript(key: string, env: NodeJS.ProcessEnv = proces
       if (isFile(path)) return path;
     }
   }
+  // A Codex thread id names the rollout file's tail: sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl.
+  if (UUID.test(key)) {
+    const sessions = join(env.CODEX_HOME ?? join(home, '.codex'), 'sessions');
+    const list = (dir: string) => { try { return readdirSync(dir); } catch { return []; } };
+    for (const y of list(sessions)) for (const m of list(join(sessions, y))) for (const d of list(join(sessions, y, m))) {
+      const name = list(join(sessions, y, m, d)).find(f => f.startsWith('rollout-') && f.endsWith(`-${key}.jsonl`));
+      if (name) return join(sessions, y, m, d, name);
+    }
+  }
   return null;
 }
 
@@ -128,7 +166,7 @@ interface IndexHit { host: string; root: string; logicalPath: string; storage: s
  * `# engram.transcript-index.v1 dest=<host>:<root> generated=<iso>` header line.
  * Rows: archive_key, storage_kind, stored_bytes, mtime_epoch, logical_path.
  */
-export function findArchivedTranscript(key: string, indexPath: string): { hit: IndexHit | null; generatedAt?: string; exists: boolean } {
+export function findArchivedTranscript(key: string, indexPath: string): { hit: IndexHit | null; generatedAt?: string; exists: boolean; missing?: string } {
   if (!existsSync(indexPath)) return { hit: null, exists: false };
   const text = readFileSync(indexPath, 'utf8');
   const header = /^# engram\.transcript-index\.v1 dest=([^:\s]+):(\S+) generated=(\S+)/m.exec(text);
@@ -139,10 +177,13 @@ export function findArchivedTranscript(key: string, indexPath: string): { hit: I
   let at = text.indexOf(needle);
   let best: IndexHit | null = null;
   let bestMtime = -1;
+  let missing: string | undefined;
   while (at !== -1) {
     const end = text.indexOf('\n', at + 1);
     const cols = text.slice(at + 1, end === -1 ? undefined : end).split('\t');
-    if (cols.length >= 5) {
+    // A `missing` row (recovery ledger) records a log no source holds; any real copy wins.
+    if (cols.length >= 5 && cols[1] === 'missing') missing = cols[4];
+    else if (cols.length >= 5) {
       const mtime = Number(cols[3]);
       if (mtime > bestMtime) {
         bestMtime = mtime;
@@ -151,7 +192,20 @@ export function findArchivedTranscript(key: string, indexPath: string): { hit: I
     }
     at = text.indexOf(needle, at + 1);
   }
-  return { hit: best, generatedAt, exists: true };
+  if (!best && UUID.test(key)) {
+    // A Codex thread id: the indexed key is rollout-<time>-<id>.
+    const tail = `-${key}\t`;
+    for (let i = text.indexOf(tail); i !== -1; i = text.indexOf(tail, i + 1)) {
+      const start = text.lastIndexOf('\n', i) + 1;
+      const end = text.indexOf('\n', i);
+      const cols = text.slice(start, end === -1 ? undefined : end).split('\t');
+      if (cols[0].startsWith('rollout-') && cols.length >= 5 && Number(cols[3]) > bestMtime) {
+        bestMtime = Number(cols[3]);
+        best = { host, root, logicalPath: cols[4], storage: cols[1], generatedAt };
+      }
+    }
+  }
+  return { hit: best, generatedAt, exists: true, ...(missing && !best ? { missing } : {}) };
 }
 
 export function locateTranscript(key: string | null, keyReason: string | undefined, opts: ProvenanceOptions = {}): TranscriptLocation {
@@ -169,14 +223,16 @@ export function locateTranscript(key: string | null, keyReason: string | undefin
     }
   }
   const indexPath = transcriptIndexPath(env, home);
-  const { hit, generatedAt, exists } = findArchivedTranscript(key, indexPath);
+  const { hit, generatedAt, exists, missing } = findArchivedTranscript(key, indexPath);
   if (hit) {
     return { status: 'archive', archive: { host: hit.host, root: hit.root, logicalPath: hit.logicalPath, storage: hit.storage },
       ...(generatedAt ? { indexGeneratedAt: generatedAt } : {}) };
   }
   return {
     status: 'log_missing',
-    reason: exists
+    reason: missing
+      ? `transcript ${key} is gone: ${missing}`
+      : exists
       ? `transcript ${key} is not on this machine and not in the archive index`
       : `transcript ${key} is not on this machine and no archive index exists at ${indexPath}`,
     ...(generatedAt ? { indexGeneratedAt: generatedAt } : {}),
@@ -203,21 +259,35 @@ export function buildProvenance(frontmatter: Json, assertion: AssertionTriple, o
       && norm(a.object) === norm(assertion.object));
   const own = strings(match?.passages);
   const notePassages = strings(metadata.passages);
-  const passages = own.length ? own : notePassages;
-  const passagesScope = own.length ? 'assertion' : notePassages.length ? 'note' : 'none';
+  let passages = own.length ? own : notePassages;
+  let passagesScope: Provenance['passagesScope'] = own.length ? 'assertion' : notePassages.length ? 'note' : 'none';
+  let support = { verdict: str(metadata.support), check: str(metadata.support_check) };
+  let link: Provenance['link'];
+  let session = sourceSession;
+  if (!passages.length && assertion.source_node_id) {
+    const rec = findFactLink(factLinksPath(opts.env ?? process.env, opts.home ?? homedir()), factLinkKey(assertion.source_node_id, assertion));
+    if (rec && typeof rec.support === 'string') {
+      const supported = rec.support === 'supported' && strings(rec.passages).length > 0;
+      if (supported) { passages = strings(rec.passages); passagesScope = 'link'; }
+      support = { verdict: rec.support, check: str(rec.support_check) };
+      link = { support: rec.support, summaryOnly: !supported, linkedAt: str(rec.linked_at), judge: str(rec.judge) };
+      session = session ?? str(rec.source_session);
+    }
+  }
 
-  const { key, reason } = sessionKeyOf(sourceSession);
+  const { key, reason } = sessionKeyOf(session);
   let transcript = locateTranscript(key, reason, opts);
   if (opts.detail === 'redacted') {
     transcript = { status: transcript.status, ...(transcript.status === 'log_missing' ? { reason: 'original log not found' } : {}) };
   }
   return {
-    sourceSession,
+    sourceSession: session,
     sessionKey: key,
     runtime,
     passages,
     passagesScope,
-    support: { verdict: str(metadata.support), check: str(metadata.support_check) },
+    support,
     transcript,
+    ...(link ? { link } : {}),
   };
 }
