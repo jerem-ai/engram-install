@@ -37,6 +37,8 @@ export interface StatusOptions {
   now?: Date;
   /** Injected for tests: run a CLI login check, return its exit code and stdout. */
   run?: (cmd: string, args: string[]) => { code: number; stdout: string };
+  /** Injected for tests: the PATH searched for the CLI (default process.env.PATH). */
+  path?: string;
   /** Injected for tests: GET a URL, return the HTTP status or null. */
   get?: (url: string) => Promise<number | null>;
 }
@@ -49,6 +51,19 @@ const defaultRun = (cmd: string, args: string[]) => {
   const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 15_000, env });
   return { code: r.status ?? 1, stdout: r.stdout ?? '' };
 };
+
+/**
+ * The CLI the extraction job runs. A shell without ~/.local/bin on PATH (ssh, cron)
+ * still has Claude Code there, and the launch agents carry its directory, so look
+ * there too rather than report a working login as logged out.
+ */
+export function findCli(name: string, home: string, path = process.env.PATH ?? ''): string | null {
+  for (const dir of [...path.split(':').filter(Boolean), join(home, '.local/bin')]) {
+    const p = join(dir, name);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
 
 const defaultGet = async (url: string) => {
   const ctl = new AbortController();
@@ -71,9 +86,13 @@ export async function engramStatusReport(opts: StatusOptions = {}): Promise<Stat
   // 1. The extraction model: the user's own login.
   const driver = env.ENGRAM_CLI_DRIVER;
   if (env.ENGRAM_EXTRACT_BACKEND === 'cli' && (driver === 'claude' || driver === 'codex')) {
-    const r = driver === 'claude' ? run('claude', ['auth', 'status']) : run('codex', ['login', 'status']);
-    const ok = r.code === 0 && (driver === 'codex' || /"loggedIn":\s*true/.test(r.stdout));
-    items.push(ok
+    const bin = findCli(driver, process.env.ENGRAM_CLI_HOME ?? home, opts.path);
+    const r = !bin ? null : driver === 'claude' ? run(bin, ['auth', 'status']) : run(bin, ['login', 'status']);
+    const ok = r !== null && r.code === 0 && (driver === 'codex' || /"loggedIn":\s*true/.test(r.stdout));
+    items.push(!bin
+      ? { id: 'backend', status: 'fail', detail: `${driver} is not installed or not on PATH, so nothing new is learned`,
+          fix: driver === 'claude' ? 'install Claude Code: curl -fsSL https://claude.ai/install.sh | bash' : 'install Codex, then run `codex login`' }
+      : ok
       ? { id: 'backend', status: 'ok', detail: `extraction uses your ${driver} login` }
       : { id: 'backend', status: 'fail', detail: `${driver} is not logged in, so nothing new is learned`,
           fix: driver === 'claude' ? 'run `claude`, then type /login' : 'run `codex login`' });
