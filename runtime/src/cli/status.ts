@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -25,10 +25,22 @@ function ago(ms: number): string {
   return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
 }
 
+/** The whole lines in the last `bytes` of a file; a line the window cuts is dropped. */
 function tailLines(path: string, bytes = 64 * 1024): string[] {
   if (!existsSync(path)) return [];
-  const text = readFileSync(path, 'utf8');
-  return text.slice(-bytes).split('\n').filter(Boolean);
+  const size = statSync(path).size;
+  const start = Math.max(0, size - bytes);
+  const buf = Buffer.alloc(size - start);
+  const fd = openSync(path, 'r');
+  try { readSync(fd, buf, 0, buf.length, start); } finally { closeSync(fd); }
+  const lines = buf.toString('utf8').split('\n');
+  if (start > 0) lines.shift();
+  return lines.filter(Boolean);
+}
+
+/** Parsed JSON lines; a half-written line (a writer mid-append) is skipped. */
+function jsonLines(lines: string[]): Array<{ timestamp: string; injected?: boolean }> {
+  return lines.flatMap(l => { try { return [JSON.parse(l)]; } catch { return []; } });
 }
 
 export interface StatusOptions {
@@ -195,9 +207,9 @@ export async function engramStatusReport(opts: StatusOptions = {}): Promise<Stat
       }
       continue;
     }
-    const lines = tailLines(receipts, 256 * 1024);
-    const last = lines.length ? JSON.parse(lines[lines.length - 1]) : null;
-    const lastHit = [...lines].reverse().map(l => JSON.parse(l)).find(r => r.injected);
+    const lines = jsonLines(tailLines(receipts, 256 * 1024));
+    const last = lines.length ? lines[lines.length - 1] : null;
+    const lastHit = [...lines].reverse().find(r => r.injected);
     items.push({ id, status: 'ok',
       detail: !last ? 'registered; no prompts seen yet'
         : `last prompt ${ago(now.getTime() - Date.parse(last.timestamp))}; last recall injected ${lastHit ? ago(now.getTime() - Date.parse(lastHit.timestamp)) : 'never yet'}` });
