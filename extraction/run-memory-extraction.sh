@@ -202,4 +202,16 @@ else
   operator_lane_extract
 fi
 touch "$MARKER"   # only reached when the python above exited 0
+
+# Claim backfill (October 20, OBSERVE.md 15e): typed claims for memory notes written
+# before the extractor wrote claims, or by an agent's own memory tool. Runs on the
+# operator lane, or anywhere ENGRAM_CLAIM_BACKFILL=on; `off` disables it. Capped at
+# ENGRAM_CLAIM_BACKFILL_CALLS model calls a run; a failure never fails extraction.
+# The public install export does not carry backfill_claims.py, so it never runs there.
+CLAIM_BACKFILL="${ENGRAM_CLAIM_BACKFILL:-}"
+if [ -r "$SCRIPT_DIR/backfill_claims.py" ] \
+    && { [ "$CLAIM_BACKFILL" = on ] || { [ -z "$CLAIM_BACKFILL" ] && [ "$BACKEND" = openai ]; }; }; then
+  "$PY" "$SCRIPT_DIR/backfill_claims.py" --limit "${ENGRAM_CLAIM_BACKFILL_CALLS:-60}" \
+    || echo "[$(date '+%F %T')] WARN: claim backfill exited $?"
+fi
 echo "[$(date '+%F %T')] memory-extraction done"

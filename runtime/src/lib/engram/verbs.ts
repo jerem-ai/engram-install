@@ -5,7 +5,7 @@ import type {
   AssertionSourceFrontmatter,
   AssertionSourceResult,
 } from '../writer.js';
-import { isPromotedMemorySource, MEMORY_AUTHORITY } from './admission.js';
+import { admittedSourceSql, MEMORY_AUTHORITY, memorySourceGate, type MemoryAdmissionMode } from './admission.js';
 import { deriveAssertionValidFrom } from './temporal.js';
 
 /**
@@ -291,26 +291,20 @@ export interface AgentProfile {
 
 export function engramProfile(
   db: Database.Database,
-  opts: { admission?: 'legacy' | 'promoted_only' } = {},
+  opts: { admission?: MemoryAdmissionMode } = {},
 ): AgentProfile {
-  const promotedOnly = opts.admission === 'promoted_only'
-    ? `AND EXISTS (
-        SELECT 1 FROM engram_memory_sources ms
-        WHERE ms.source_node_id = engram_assertions.source_node_id
-          AND ms.trust_state = 'promoted'
-          AND ms.authority = 'informational_only'
-      )`
+  const gate = memorySourceGate(db, opts.admission);
+  const sourceFilter = opts.admission === 'promoted_only' || opts.admission === 'admitted'
+    ? `AND ${admittedSourceSql('engram_assertions.source_node_id', opts.admission)}`
     : '';
   const admitted = (rows: EngramAssertion[]): EngramAssertion[] =>
-    opts.admission === 'promoted_only'
-      ? rows.filter(row => isPromotedMemorySource(db, row.source_node_id))
-      : rows;
+    gate ? rows.filter(row => gate(row.source_node_id)) : rows;
   // Static profile: durable high-confidence assertions about user preferences, identity, constraints
   const preferences = db.prepare(`
     SELECT * FROM engram_assertions
     WHERE status = 'current' AND confidence >= 0.8
       AND predicate IN ('prefers', 'likes', 'wants', 'chooses', 'uses', 'dislikes', 'avoids', 'rejects')
-      ${promotedOnly}
+      ${sourceFilter}
     ORDER BY confidence DESC LIMIT 20
   `).all() as EngramAssertion[];
 
@@ -318,7 +312,7 @@ export function engramProfile(
     SELECT * FROM engram_assertions
     WHERE status = 'current' AND confidence >= 0.9
       AND predicate IN ('is', 'works_as', 'lives_in', 'owns', 'drives')
-      ${promotedOnly}
+      ${sourceFilter}
     ORDER BY confidence DESC LIMIT 10
   `).all() as EngramAssertion[];
 
@@ -326,7 +320,7 @@ export function engramProfile(
     SELECT * FROM engram_assertions
     WHERE status = 'current' AND confidence >= 0.7
       AND predicate IN ('requires', 'needs', 'must', 'cannot', 'should', 'should_not')
-      ${promotedOnly}
+      ${sourceFilter}
     ORDER BY confidence DESC LIMIT 15
   `).all() as EngramAssertion[];
 
@@ -335,7 +329,7 @@ export function engramProfile(
     WHERE status = 'current' AND confidence >= 0.7
       AND (subject = 'Mac Mini' OR subject = 'UM790' OR subject = 'system'
            OR predicate IN ('runs_on', 'deployed_to', 'hosts', 'uses_infra'))
-      ${promotedOnly}
+      ${sourceFilter}
     ORDER BY confidence DESC LIMIT 10
   `).all() as EngramAssertion[];
 
@@ -345,14 +339,14 @@ export function engramProfile(
     WHERE status = 'current'
       AND (predicate = 'project' OR predicate = 'working_on' OR predicate = 'developing'
            OR subject IN ('Engram', 'Hermes', 'Maestro', 'Alfred', 'PrintOS'))
-      ${promotedOnly}
+      ${sourceFilter}
     ORDER BY created_at DESC LIMIT 15
   `).all() as EngramAssertion[];
 
   const recentContext = db.prepare(`
     SELECT * FROM engram_assertions
     WHERE status = 'current' AND created_at > datetime('now', '-7 days')
-      ${promotedOnly}
+      ${sourceFilter}
     ORDER BY created_at DESC LIMIT 20
   `).all() as EngramAssertion[];
 
@@ -368,9 +362,8 @@ export function engramProfile(
     assertion_a_id: string; assertion_b_id: string;
     source_a: string; source_b: string;
   }>;
-  const admittedContradictions = opts.admission === 'promoted_only'
-    ? openCtr.filter(c => isPromotedMemorySource(db, c.source_a)
-      && isPromotedMemorySource(db, c.source_b))
+  const admittedContradictions = gate
+    ? openCtr.filter(c => gate(c.source_a) && gate(c.source_b))
     : openCtr;
 
   return {

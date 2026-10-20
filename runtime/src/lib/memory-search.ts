@@ -1,7 +1,7 @@
 import type { Store } from './store.js';
 import type { Embedder } from './embedder.js';
 import type { SearchResult } from './types.js';
-import { getMemorySourceAdmission, isPromotedMemorySource } from './engram/admission.js';
+import { admittedSourceSql, getMemorySourceAdmission, memorySourceGate, type MemoryAdmissionMode } from './engram/admission.js';
 import { memoryEvidence } from './memory-evidence.js';
 import { isStale, memoryAge } from './memory-currency.js';
 import { retiredSources } from './engram/source-retirement.js';
@@ -147,8 +147,8 @@ export interface MemorySearchOpts {
   minScore?: number;
   /** Query-time diversity cap. See DiversityOpts for defaults. */
   diversity?: DiversityOpts;
-  /** Require a private server-side promoted-source record. */
-  admission?: 'legacy' | 'promoted_only';
+  /** Which memory sources may be returned (see MemoryAdmissionMode). */
+  admission?: MemoryAdmissionMode;
   /** Offline evaluation only: receives each list's order and the fused ranking. */
   trace?: (trace: FusionTrace) => void;
   /** Fusion overrides for offline evaluation; production uses the defaults. */
@@ -433,7 +433,7 @@ export async function searchMemoryHybrid(
   const k = opts.k ?? 10;
   const minScore = opts.minScore ?? 0;
   const provFilter = { persona: opts.persona, runtime: opts.runtime, model: opts.model };
-  const promotedOnly = opts.admission === 'promoted_only';
+  const gate = memorySourceGate(store.db, opts.admission);
 
   const fusion = { ...FUSION_DEFAULTS, ...(answerVerifyEnabled() ? {} : { verifyFtsRank: 0, rerankDepth: 0 }), ...opts.fusion };
   const questionOk = !fusion.verifyQuestionsOnly || isQuestionQuery(query);
@@ -453,8 +453,8 @@ export async function searchMemoryHybrid(
   const embedding = await embedder.embed(query);
 
   // Vector: searchMemory already filters to Memory/ nodes.
-  const vecResults = store.searchMemory(embedding, promotedOnly ? store.countNodes() : poolK * 4 * overfetch)
-    .filter(result => !promotedOnly || isPromotedMemorySource(store.db, result.nodeId))
+  const vecResults = store.searchMemory(embedding, gate ? store.countNodes() : poolK * 4 * overfetch)
+    .filter(result => !gate || gate(result.nodeId))
     .filter(result => !fusion.eligibleArms || eligible(result))
     .slice(0, poolK * 4);
 
@@ -482,12 +482,7 @@ export async function searchMemoryHybrid(
         FROM nodes_fts f
         JOIN nodes n ON n.rowid = f.rowid
         WHERE nodes_fts MATCH ? AND n.id LIKE 'Memory/%'
-          ${promotedOnly ? `AND EXISTS (
-            SELECT 1 FROM engram_memory_sources ms
-            WHERE ms.source_node_id = n.id
-              AND ms.trust_state = 'promoted'
-              AND ms.authority = 'informational_only'
-          )` : ''}
+          ${opts.admission === 'promoted_only' || opts.admission === 'admitted' ? `AND ${admittedSourceSql('n.id', opts.admission)}` : ''}
         ORDER BY rank
         LIMIT ${40 * overfetch}
       `).all(sanitizedQuery) as Array<{
@@ -503,7 +498,7 @@ export async function searchMemoryHybrid(
         frontmatter: (() => {
           try { return JSON.parse(r.frontmatter) as Record<string, unknown>; } catch { return {}; }
         })(),
-      })).filter(result => !promotedOnly || isPromotedMemorySource(store.db, result.nodeId))
+      })).filter(result => !gate || gate(result.nodeId))
         .filter(result => !fusion.eligibleArms || eligible(result))
         .slice(0, 40);
     } catch {
@@ -554,7 +549,7 @@ export async function searchMemoryHybrid(
     const candidates = ftsResults.slice(0, fusion.anchorFtsRank).filter(r => !inArm.has(r.nodeId));
     if (candidates.length > 0) {
       const deep = store.searchMemory(embedding, ANCHOR_SCAN)
-        .filter(r => !promotedOnly || isPromotedMemorySource(store.db, r.nodeId));
+        .filter(r => !gate || gate(r.nodeId));
       const noteCos = new Map(deep.map(r => [r.nodeId, r.cosine ?? -1]));
       for (const r of candidates) {
         const own = store.getNodeEmbedding(r.nodeId);

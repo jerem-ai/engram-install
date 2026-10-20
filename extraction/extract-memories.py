@@ -465,8 +465,8 @@ def write_memory(mem_dir: Path, item: dict, source_session: str = "",
         prov += "  scope_review: unreviewed\n"
     if item.get("assertions"):
         # Keep generated claims separate from curated top-level assertions and
-        # memory-wide currency fields. Admission reviews each claim independently.
-        prov += "  assertion_review: unreviewed\n"
+        # memory-wide currency fields. Admission state lives in the candidates
+        # table, not on the note (the assertion_review tag was dropped 2026-10-20).
         prov += f"  assertions: {json.dumps(item['assertions'], ensure_ascii=False)}\n"
     # Curated-key preservation: canonical/aliases (the Engram canonical layer)
     # and any other hand-added top-level frontmatter are curation the model

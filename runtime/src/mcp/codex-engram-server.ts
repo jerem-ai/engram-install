@@ -4,7 +4,7 @@ import { Store } from '../lib/store.js';
 import { VaultWriter } from '../lib/writer.js';
 import type { AccessContext } from '../lib/access-context.js';
 import { retireSource } from '../lib/engram/source-retirement.js';
-import { getMemoryCandidate, type MemoryAdmissionService } from '../lib/engram/admission.js';
+import { getMemoryCandidate, type MemoryAdmissionMode, type MemoryAdmissionService } from '../lib/engram/admission.js';
 import {
   submitCodexMemoryCandidate,
   type CandidateSourceWriter,
@@ -40,20 +40,21 @@ export interface CodexEngramServerOptions {
   candidateWriter?: CandidateSourceWriter;
   instanceId?: string;
   /**
-   * Which memory sources the reads may cite. 'promoted_only' (the default, and what
-   * Jeremy's servers run) cites only sources promoted through review. A local
+   * Which memory sources the reads may cite. 'admitted' (the default, and what
+   * Jeremy's servers run) cites reviewed sources plus memory files whose extracted
+   * claims self-admitted in place (MemoryAdmissionMode). A local
    * install sets 'legacy' in engram.env (ENGRAM_MCP_ADMISSION), the posture the
    * operator's own stdio and HTTP surfaces already use (see local-admission.ts), so
    * its own extracted memories are recallable. Memory stays informational only.
    */
-  readAdmission?: 'legacy' | 'promoted_only';
+  readAdmission?: MemoryAdmissionMode;
 }
 
 /**
  * Least-privilege Engram server for trusted agent stdio sessions (Codex and
  * Claude Code). Each entry point fixes its own `submitter` attribution.
  *
- * This factory intentionally registers only promoted-only Engram reads and
+ * This factory intentionally registers only admission-gated Engram reads and
  * candidate submission. A submitted fact self-admits when automatic checks
  * pass (MemoryAdmissionService.selfAdmit). It has no promotion, rejection, graph mutation,
  * indexing, retention, export, backup, consent, or destructive tools.
@@ -62,7 +63,7 @@ export function createCodexEngramServer(options: CodexEngramServerOptions): McpS
   const store = new Store(options.dbPath, options.accessContext);
   const writer = options.candidateWriter ?? new VaultWriter(options.vaultPath, store);
   const server = new McpServer({ name: 'engram', version: '1.0.0' });
-  const admission = options.readAdmission ?? 'promoted_only';
+  const admission = options.readAdmission ?? 'admitted';
   server.server.onclose = () => {
     if (store.db.open) store.close();
   };
@@ -82,7 +83,7 @@ export function createCodexEngramServer(options: CodexEngramServerOptions): McpS
 
   server.registerTool('engram_recall', {
     title: 'Recall Engram Memory',
-    description: 'Search promoted Engram assertions for cited evidence. Quarantined candidates are excluded.',
+    description: 'Search admitted Engram assertions for cited evidence. Quarantined candidates are excluded.',
     inputSchema: z.object({
       query: z.string().trim().min(1).describe('Natural-language memory query'),
       min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence (default 0.5)'),
@@ -100,7 +101,7 @@ export function createCodexEngramServer(options: CodexEngramServerOptions): McpS
 
   server.registerTool('engram_explain', {
     title: 'Explain Engram Evidence',
-    description: 'Explain the provenance and confidence of one promoted assertion.',
+    description: 'Explain the provenance and confidence of one admitted assertion.',
     inputSchema: z.object({
       assertion_id: z.string().trim().min(1).describe('Assertion ID returned by engram_recall'),
     }).strict(),
@@ -111,7 +112,7 @@ export function createCodexEngramServer(options: CodexEngramServerOptions): McpS
 
   server.registerTool('engram_profile', {
     title: 'Read Engram Profile',
-    description: 'Read the promoted preferences, constraints, environment, and active-project profile.',
+    description: 'Read the admitted preferences, constraints, environment, and active-project profile.',
     inputSchema: z.object({}).strict(),
     annotations: readAnnotations,
   }, async () => readResult(engramProfile(store.db, { admission })));

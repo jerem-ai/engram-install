@@ -21,8 +21,8 @@ async function main(): Promise<void> {
     memoryAdmission: createMemoryAdmissionService(config.dataDir, { authorizer }),
     authorizer,
     identityFactory: () => createLocalOperatorIdentity(accessContext),
-    // Per-install setting only; with no engram.env the reads stay promoted-only.
-    readAdmission: readEngramEnv().ENGRAM_MCP_ADMISSION === 'legacy' ? 'legacy' : 'promoted_only',
+    // Per-install setting only; with no engram.env the reads cite admitted sources.
+    readAdmission: readEngramEnv().ENGRAM_MCP_ADMISSION === 'legacy' ? 'legacy' : 'admitted',
   });
   await server.connect(new StdioServerTransport());
 }

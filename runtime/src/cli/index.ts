@@ -337,6 +337,7 @@ program
   .option('--max-results <n>', 'Maximum evidence results', '10')
   .option('--min-confidence <f>', 'Structured assertion confidence threshold', '0.5')
   .option('--promoted-only', 'Return only privately reviewed promoted memory sources')
+  .option('--admitted', 'Return promoted sources plus memory files whose claims were admitted in place')
   .action((query: string | undefined, opts) => {
     if (query && opts.queryStdin) throw new Error('engram-recall accepts either a query argument or --query-stdin, not both');
     const effectiveQuery = opts.queryStdin ? readFileSync(0, 'utf8') : query;
@@ -348,7 +349,7 @@ program
         query: effectiveQuery.trim(),
         maxResults: parseInt(opts.maxResults),
         minConfidence: parseFloat(opts.minConfidence),
-        admission: opts.promotedOnly ? 'promoted_only' : 'legacy',
+        admission: opts.promotedOnly ? 'promoted_only' : opts.admitted ? 'admitted' : 'legacy',
       }));
     } finally {
       store.close();
@@ -364,6 +365,7 @@ program
   .option('--limit <n>', 'Max results', '10')
   .option('--min-score <f>', 'Minimum RRF fused score (default 0)', '0')
   .option('--promoted-only', 'Return only privately reviewed promoted memory sources')
+  .option('--admitted', 'Return promoted sources plus memory files whose claims were admitted in place')
   .action(async (query: string | undefined, opts) => {
     if (query && opts.queryStdin) throw new Error('memory-search accepts either a query argument or --query-stdin, not both');
     const effectiveQuery = opts.queryStdin ? readFileSync(0, 'utf8') : query;
@@ -379,7 +381,7 @@ program
       persona: opts.persona,
       runtime: opts.runtime,
       minScore: parseFloat(opts.minScore),
-      admission: opts.promotedOnly ? 'promoted_only' : 'legacy',
+      admission: opts.promotedOnly ? 'promoted_only' : opts.admitted ? 'admitted' : 'legacy',
     });
     output(results);
     await embedder.dispose();

@@ -21,28 +21,38 @@ import { makeRoom, realClock, type Clock, type KippChatReply, type KippTransport
  * case set passes the gate: the synthetic cases carry hand-written gold, and
  * model output never becomes gold. Without that receipt a night runs in shadow.
  */
-export const FACT_JUDGE_PROMPT_VERSION = 'fact-judge-v2';
+export const FACT_JUDGE_PROMPT_VERSION = 'fact-judge-v3';
 export const VALIDATION_SCHEMA = 'engram.fact-judge-validation.v1';
 
 export const FACT_JUDGE_SYSTEM = `You check a personal memory store for facts that cannot all be true now. Each request lists facts that share one subject and one predicate. Compare every pair of facts and sort it into one of three kinds.
 
-CONFLICT: the two cannot both be true at the same time, because one replaces or corrects the other. Typical cases: a different value for something that has one value at a time (a version, a date, a count, a host, a port, a setting, a status, a location, the single owner of one thing), or a later statement that reverses an earlier one.
+CONFLICT: one fact replaces or corrects the other, so they cannot both be true now. Typical cases: two different values of the same kind for something that holds one value at a time (a version, a date, a count, an amount, a host, a port, a setting, a status, the tool picked for one job, the single owner of one thing), or a later statement that reverses an earlier one.
 DUPLICATE: the two say the same thing in different words. Keeping only one of them would lose nothing that matters; one may add a small detail.
 BOTH STAND: the two can be true together. A subject can have many preferences, rules, tools, approvals, requests, items or parts; the same idea can apply at different scopes or for different purposes; one fact can add a separate fact. Facts with different numbers, names, versions or dates are never duplicates.
 
-Before calling a pair a CONFLICT, check that both facts fill the same single slot. Two facts about different machines, hosts, places or copies both stand. Two facts about different aspects of the subject both stand: hardware and operating system, a model and the device it runs on, one schedule here and another there. A subject that serves, runs, installs or hosts several things at once has several values, so those both stand.
+Work in two steps.
+
+Step 1, in "kinds": for each fact in order, write two to five words naming the kind of value it gives and anything it is tied to, such as "host", "clock time", "trigger event", "room", "operating system", "port on Scout", "backup tool", "sync tool", "browser for automation".
+
+Step 2: compare pairs. A pair is a CONFLICT only when all three checks hold. If any check fails, the pair both stands.
+1. Same kind of value. Both facts got the same kind in step 1. A machine and a room, a clock time and a trigger event, an operating system and a chassis, a backup tool and a sync tool are different kinds, so they both stand.
+2. Same scope. Neither fact is tied to a machine, place, copy, purpose or condition that the other fact does not share. "On Scout at 04:35" and "on the laptop at 05:10" describe two different runs, so they both stand.
+3. One value at a time. The subject cannot hold both values at once. A subject that serves, runs, stores, installs or hosts several things at once has several values, so those both stand.
+
+Judge each pair on its own. When two facts conflict, a third fact of a different kind still stands with both of them.
 
 If you are unsure, choose BOTH STAND. Judge only from the facts.
 
-Reply with JSON only: {"conflicts": [[a, b], ...], "duplicates": [[a, b], ...]} using the fact numbers. Leave out every pair that both stands. Use empty lists when nothing conflicts or repeats.`;
+Reply with JSON only: {"kinds": ["...", ...], "conflicts": [[a, b], ...], "duplicates": [[a, b], ...]} using the fact numbers. Leave out every pair that both stands. Use empty lists when nothing conflicts or repeats.`;
 
 export const FACT_JUDGE_FORMAT = {
   type: 'object',
   properties: {
+    kinds: { type: 'array', items: { type: 'string' } },
     conflicts: { type: 'array', items: { type: 'array', items: { type: 'integer' } } },
     duplicates: { type: 'array', items: { type: 'array', items: { type: 'integer' } } },
   },
-  required: ['conflicts', 'duplicates'],
+  required: ['kinds', 'conflicts', 'duplicates'],
 };
 
 export const FACT_JUDGE_PROMPT_DIGEST = createHash('sha256')
@@ -200,6 +210,14 @@ export function parseVerdict(text: string, n: number): Verdict {
   const duplicates = pairs(raw.duplicates);
   const both = new Set(conflicts.map(p => p.join(',')).filter(k => duplicates.some(d => d.join(',') === k)));
   return { conflicts: conflicts.filter(p => !both.has(p.join(','))), duplicates: duplicates.filter(p => !both.has(p.join(','))) };
+}
+
+/** The judge's per-fact kind labels, for the log only; verdicts never depend on them. */
+export function kindsOf(text: string): string[] | null {
+  try {
+    const k = (JSON.parse(text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')) as { kinds?: unknown }).kinds;
+    return Array.isArray(k) ? k.map(String) : null;
+  } catch { return null; }
 }
 
 /** Conflicts both models named; duplicates from the primary alone. */
@@ -386,7 +404,7 @@ export function runValidation(opts: {
     try {
       const { reply, verdict } = ask(config.judge.model, kase);
       primary.set(kase.id, { verdict, seconds: reply.seconds });
-      log(`case ${kase.id} (${kase.kind}) ${reply.seconds}s conflicts=${JSON.stringify(one(verdict.conflicts))} duplicates=${JSON.stringify(one(verdict.duplicates))}`);
+      log(`case ${kase.id} (${kase.kind}) ${reply.seconds}s kinds=${JSON.stringify(kindsOf(reply.content))} conflicts=${JSON.stringify(one(verdict.conflicts))} duplicates=${JSON.stringify(one(verdict.duplicates))}`);
     } catch (error) {
       primary.set(kase.id, { error: (error as Error).message.slice(0, 200) });
       log(`case ${kase.id} FAILED: ${(error as Error).message.slice(0, 200)}`);

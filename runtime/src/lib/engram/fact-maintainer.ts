@@ -17,6 +17,11 @@ import { SELF_ADMISSION_POLICY_VERSION, SELF_ADMISSION_REASON } from './admissio
  * - retire stale candidates: a quarantined extracted claim whose memory file
  *   already has the same claim admitted (an "admitted twin"), or no longer
  *   states it at all, is retired as rejected with the triple kept for revert.
+ * - retire link copies: a current fact with no admission record that only
+ *   copies an entry of its own note's frontmatter `relations` (same type and
+ *   target) is a graph edge, not a fact (ENGRAM.md: relations are topology).
+ *   A June 23 derivation made 4,758 of them; it becomes retracted. The edge
+ *   itself stays in the graph.
  *
  * The Kipp judge (fact-judge.ts) writes `judge_supersede` actions through the
  * same receipts and revert.
@@ -52,7 +57,8 @@ export type MaintenanceAction =
   | { kind: 'retire_candidate'; candidate_id: string; reason: typeof RETIRED_TWIN | typeof RETIRED_DROPPED;
       twin_id: string | null; prior: CandidateState; after: CandidateState }
   | { kind: 'judge_supersede'; assertion_id: string; winner_id: string; verdict: 'conflict' | 'duplicate';
-      group: string; prior: AssertionState; after: AssertionState };
+      group: string; prior: AssertionState; after: AssertionState }
+  | { kind: 'retire_link'; assertion_id: string; prior: AssertionState; after: AssertionState };
 
 export interface MaintenanceReceipt {
   schema: typeof MAINTENANCE_RECEIPT_SCHEMA;
@@ -222,6 +228,44 @@ export function planCandidateRetirement(db: Database.Database, now: string): Mai
   return actions;
 }
 
+/** A relation target as written ("[[Folder/Note.md]]", "Note") reduced to the note name a link fact used. */
+export function relationTargetName(target: unknown): string | null {
+  if (typeof target !== 'string') return null;
+  const name = target.trim().replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].replace(/\.md$/, '').split('/').pop();
+  return name ? name.trim() : null;
+}
+
+/**
+ * Plan retirement of current facts that only copy a frontmatter relation of their own
+ * note. A fact any admission record backs is never touched, nor one whose note's
+ * relations no longer hold that exact type and target.
+ */
+export function planLinkRetirement(db: Database.Database, now: string): MaintenanceAction[] {
+  const rows = db.prepare(`
+    SELECT a.id, a.predicate, a.object, a.status, a.valid_to, a.superseded_by, a.updated_at, n.frontmatter
+    FROM engram_assertions a
+    JOIN nodes n ON n.id = a.source_node_id
+    WHERE a.owner_principal_id = current_principal_id() AND a.status = 'current'
+      AND n.frontmatter LIKE '%"relations"%'
+      AND NOT EXISTS (SELECT 1 FROM records_engram_memory_candidates c
+        WHERE c.tenant_id = a.tenant_id AND c.assertion_id = a.id)
+  `).all() as Array<{ id: string; predicate: string; object: string; status: string; valid_to: string | null;
+    superseded_by: string | null; updated_at: string; frontmatter: string }>;
+  const actions: MaintenanceAction[] = [];
+  for (const r of rows) {
+    let relations: unknown;
+    try { relations = (JSON.parse(r.frontmatter) as Record<string, unknown>).relations; } catch { continue; }
+    if (!Array.isArray(relations)) continue;
+    const copies = relations.some((rel: Record<string, unknown>) => rel && rel.type === r.predicate
+      && relationTargetName(rel.target) === r.object.trim());
+    if (!copies) continue;
+    const prior = stateOf(r);
+    actions.push({ kind: 'retire_link', assertion_id: r.id, prior,
+      after: { status: 'retracted', valid_to: prior.valid_to, superseded_by: prior.superseded_by, updated_at: now } });
+  }
+  return actions;
+}
+
 /** Compare-and-set one assertion. False when the row moved on since the action was planned. */
 function casAssertion(db: Database.Database, id: string, from: AssertionState, to: AssertionState): boolean {
   try {
@@ -346,7 +390,8 @@ export function runDeterministicMaintenance(
   const dir = opts.dir ?? factMaintainerDir();
   const now = opts.now ?? new Date().toISOString();
   const id = runId('det', now);
-  const planned = [...planSourceFollow(db, now, retiredBySourceFollow(dir)), ...planCandidateRetirement(db, now)];
+  const planned = [...planSourceFollow(db, now, retiredBySourceFollow(dir)), ...planCandidateRetirement(db, now),
+    ...planLinkRetirement(db, now)];
   if (opts.dryRun) return { run_id: id, dry_run: true, counts: countActions(planned), applied: 0, skipped: 0, receipt: null };
   const result = db.transaction(() => {
     const applied = planned.filter(a => applyAction(db, a));

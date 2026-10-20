@@ -3,7 +3,7 @@ import { retiredSources } from './source-retirement.js';
 import { queryAssertions, getAssertion } from './assertions.js';
 import { queryEpisodes, getEpisode } from './episodes.js';
 import type { EngramAssertion } from './assertions.js';
-import { isPromotedMemorySource, MEMORY_AUTHORITY } from './admission.js';
+import { MEMORY_AUTHORITY, memorySourceGate, type MemoryAdmissionMode } from './admission.js';
 import { buildProvenance, parseFrontmatter as parseNodeFrontmatter, type Provenance, type ProvenanceOptions } from './provenance.js';
 
 // --- Types (matching ENGRAM.md recall contract) ---
@@ -69,7 +69,7 @@ export interface RecallOptions {
   minConfidence?: number;
   mode?: 'current' | 'historical' | 'audit';
   maxResults?: number;
-  admission?: 'legacy' | 'promoted_only';
+  admission?: MemoryAdmissionMode;
 }
 
 // --- Helpers ---
@@ -572,7 +572,7 @@ function proseFallbackSearch(
   db: Database.Database,
   query: string,
   limit: number,
-  promotedOnly: boolean,
+  gate: ((sourceNodeId: string) => boolean) | null,
 ): Array<{ nodeId: string; quote: string; score: number }> {
   if (!query) return [];
 
@@ -608,7 +608,7 @@ function proseFallbackSearch(
     }
 
     const accepted = rows.flatMap(r => {
-      if (promotedOnly && !isPromotedMemorySource(db, r.id)) return [];
+      if (gate && !gate(r.id)) return [];
       const frontmatter = parseFrontmatter(r.frontmatter ?? '{}');
       const indexedTokens = indexedProseTokens(r.title, r.content ?? '', frontmatter);
       const matchingTokens = tokens.filter(token => matchesProseToken(token, indexedTokens));
@@ -649,7 +649,7 @@ export function engramRecall(
   const minConfidence = opts.minConfidence ?? 0.5;
   const maxResults = opts.maxResults ?? 10;
   const query = opts.query;
-  const promotedOnly = opts.admission === 'promoted_only';
+  const gate = memorySourceGate(db, opts.admission);
 
   // Phase 1a: Assertion search — query the engram_assertions table
   // Select by the question's words first; scoring only the newest 100 rows hid most facts.
@@ -660,7 +660,7 @@ export function engramRecall(
     limit: 100,
     // Audit lists inventory whatever the question says.
     ...(mode === 'audit' ? {} : { terms: queryTerms }),
-  }).filter(a => (!promotedOnly || isPromotedMemorySource(db, a.source_node_id))
+  }).filter(a => (!gate || gate(a.source_node_id))
     // A fact from a retired note (source-retirement.ts) answers as historical, not current.
     && (mode === 'audit' || !a.source_node_id || !retired.has(a.source_node_id)));
 
@@ -687,7 +687,7 @@ export function engramRecall(
       mode: 'audit',
       limit: 100,
       terms: queryTerms,
-    }).filter(a => (!promotedOnly || isPromotedMemorySource(db, a.source_node_id))
+    }).filter(a => (!gate || gate(a.source_node_id))
       && (a.status === 'historical' || a.status === 'retracted' || a.currency_stale === 1
         || (!!a.source_node_id && retired.has(a.source_node_id))));
 
@@ -709,7 +709,7 @@ export function engramRecall(
   // Phase 1c: Episode search
   const episodeCandidates = queryEpisodes(db, { limit: 50 });
   const matchingEpisodes = episodeCandidates.filter(ep => {
-    if (promotedOnly && !isPromotedMemorySource(db, ep.source_node_id)) return false;
+    if (gate && !gate(ep.source_node_id)) return false;
     const q = query.toLowerCase();
     return ep.title.toLowerCase().includes(q)
       || ep.episode_type.toLowerCase().includes(q)
@@ -785,7 +785,7 @@ export function engramRecall(
       status = 'historical_only';
     } else {
       // Prose fallback: search node content via FTS5
-      const proseResults = proseFallbackSearch(db, query, maxResults, promotedOnly);
+      const proseResults = proseFallbackSearch(db, query, maxResults, gate);
       if (proseResults.length > 0) {
         status = 'low_confidence_evidence';
         // Add prose results as evidence
@@ -990,11 +990,11 @@ export interface ExplainResult {
 export function engramExplain(
   db: Database.Database,
   assertionId: string,
-  opts: { admission?: 'legacy' | 'promoted_only'; provenance?: ProvenanceOptions } = {},
+  opts: { admission?: MemoryAdmissionMode; provenance?: ProvenanceOptions } = {},
 ): ExplainResult | { error: string } {
   const assertion = getAssertion(db, assertionId);
-  if (!assertion || (opts.admission === 'promoted_only'
-    && !isPromotedMemorySource(db, assertion.source_node_id))) {
+  const gate = memorySourceGate(db, opts.admission);
+  if (!assertion || (gate && !gate(assertion.source_node_id))) {
     return { error: `Assertion ${assertionId} not found.` };
   }
 
@@ -1014,7 +1014,7 @@ export function engramExplain(
     limit: 10,
   })
     .filter(a => a.id !== assertion.id
-      && (opts.admission !== 'promoted_only' || isPromotedMemorySource(db, a.source_node_id)))
+      && (!gate || gate(a.source_node_id)))
     .map(a => `  - ${a.id}: "${a.subject} ${a.predicate} ${a.object}" (confidence: ${a.confidence}, status: ${a.status})`);
 
   let citationExcerpt: string | null = null;

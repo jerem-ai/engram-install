@@ -624,6 +624,60 @@ export function isPromotedMemorySource(db: Database.Database, sourceNodeId: stri
   return !!admission && admission.source_digest === computeMemorySourceDigest(db, sourceNodeId);
 }
 
+/**
+ * Which memory sources a read may cite. `legacy` cites any memory note.
+ * `promoted_only` cites reviewed sources (engram_remember notes); OpenClaw stays
+ * on it. `admitted` also cites a memory file whose extracted claims were
+ * self-admitted in place, while the file still matches what was admitted: those
+ * admissions write no source row, so `promoted_only` never saw them.
+ */
+export type MemoryAdmissionMode = 'legacy' | 'promoted_only' | 'admitted';
+
+/** A per-read source check for `mode`, or null when every source is allowed. */
+export function memorySourceGate(
+  db: Database.Database,
+  mode: MemoryAdmissionMode | undefined,
+): ((sourceNodeId: string | null | undefined) => boolean) | null {
+  if (mode !== 'promoted_only' && mode !== 'admitted') return null;
+  let inPlace: Map<string, Set<string>> | null = null;
+  const seen = new Map<string, boolean>();
+  return (sourceNodeId) => {
+    if (!sourceNodeId) return false;
+    const cached = seen.get(sourceNodeId);
+    if (cached !== undefined) return cached;
+    let ok = isPromotedMemorySource(db, sourceNodeId);
+    if (!ok && mode === 'admitted') {
+      inPlace ??= inPlaceAdmittedHashes(db);
+      const hashes = inPlace.get(sourceNodeId);
+      ok = !!hashes && hashes.has(`extracted-v1:${computeMemorySourceDigest(db, sourceNodeId)}`);
+    }
+    seen.set(sourceNodeId, ok);
+    return ok;
+  };
+}
+
+/** SQL for "this note is a promoted source, or holds a claim admitted in place"; bind no parameters. */
+export function admittedSourceSql(column: string, mode: 'promoted_only' | 'admitted'): string {
+  const promoted = `EXISTS (SELECT 1 FROM engram_memory_sources ms WHERE ms.source_node_id = ${column}
+    AND ms.trust_state = 'promoted' AND ms.authority = 'informational_only')`;
+  if (mode === 'promoted_only') return promoted;
+  return `(${promoted} OR EXISTS (SELECT 1 FROM engram_memory_candidates mc WHERE mc.source_node_id = ${column}
+    AND mc.trust_state = 'promoted' AND mc.source_hash LIKE 'extracted-v1:%'))`;
+}
+
+function inPlaceAdmittedHashes(db: Database.Database): Map<string, Set<string>> {
+  const rows = db.prepare(`
+    SELECT source_node_id, source_hash FROM engram_memory_candidates
+    WHERE trust_state = 'promoted' AND source_hash LIKE 'extracted-v1:%' AND source_node_id IS NOT NULL
+  `).all() as Array<{ source_node_id: string; source_hash: string }>;
+  const out = new Map<string, Set<string>>();
+  for (const r of rows) {
+    if (!out.has(r.source_node_id)) out.set(r.source_node_id, new Set());
+    out.get(r.source_node_id)!.add(r.source_hash);
+  }
+  return out;
+}
+
 export function computeMemorySourceDigest(db: Database.Database, sourceNodeId: string): string {
   const source = db.prepare(`
     SELECT id, title, content, frontmatter FROM nodes WHERE id = ?

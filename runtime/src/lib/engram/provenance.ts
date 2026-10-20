@@ -34,9 +34,13 @@ export interface Provenance {
   /** source_session without its runtime prefix, as transcript files are named. */
   sessionKey: string | null;
   runtime: string | null;
-  /** Quoted passages for this assertion, the note's, or a supported fact link's. */
+  /**
+   * Quoted passages for this assertion, the note's, or a supported fact link's.
+   * `memory_text`: the assertion's passages quote the memory note itself, not its
+   * transcript (claims backfilled onto a note that stored no passages).
+   */
   passages: string[];
-  passagesScope: 'assertion' | 'note' | 'link' | 'none';
+  passagesScope: 'assertion' | 'memory_text' | 'note' | 'link' | 'none';
   support: { verdict: string | null; check: string | null };
   transcript: TranscriptLocation;
   /** The nightly linker's result for an engram_remember fact (extraction/link_facts.py). */
@@ -269,7 +273,8 @@ export function buildProvenance(frontmatter: Json, assertion: AssertionTriple, o
   const own = strings(match?.passages);
   const notePassages = strings(metadata.passages);
   let passages = own.length ? own : notePassages;
-  let passagesScope: Provenance['passagesScope'] = own.length ? 'assertion' : notePassages.length ? 'note' : 'none';
+  const ownScope = metadata.assertion_basis === 'note' ? 'memory_text' as const : 'assertion' as const;
+  let passagesScope: Provenance['passagesScope'] = own.length ? ownScope : notePassages.length ? 'note' : 'none';
   let support = { verdict: str(metadata.support), check: str(metadata.support_check) };
   let link: Provenance['link'];
   let session = sourceSession;
