@@ -119,9 +119,11 @@ export async function engramStatusReport(opts: StatusOptions = {}): Promise<Stat
       ...(failedSince || age > 26 * 3600_000 ? { fix: kick('extraction') } : {}) });
   }
 
-  // 3. Memories written in the last 7 days.
+  // 3. Memories: Engram's extractor writes some, Claude Code's own memory others. The
+  // extractor skips a fact Claude Code already saved, and the mirror recalls both, so
+  // either kind counts.
   const root = env.ENGRAM_MEMORY_ROOT ?? join(home, '.claude/projects');
-  let recent = 0, extracted = 0;
+  let recent = 0, extracted = 0, own = 0;
   if (existsSync(root)) {
     for (const proj of readdirSync(root)) {
       const dir = join(root, proj, 'memory');
@@ -129,15 +131,16 @@ export async function engramStatusReport(opts: StatusOptions = {}): Promise<Stat
       for (const f of readdirSync(dir)) {
         if (!f.endsWith('.md') || f === 'MEMORY.md') continue;
         const text = readFileSync(join(dir, f), 'utf8');
-        if (!/^\s+extractor_model: /m.test(text)) continue;
+        if (!/^\s+extractor_model: /m.test(text)) { own += 1; continue; }
         extracted += 1;
         if (now.getTime() - statSync(join(dir, f)).mtimeMs < 7 * DAY) recent += 1;
       }
     }
   }
-  items.push({ id: 'memories', status: recent > 0 || extracted > 0 ? 'ok' : 'warn',
-    detail: `${recent} memories learned in the last 7 days (${extracted} in all)`,
-    ...(extracted === 0 ? { fix: 'use Claude Code or Codex for a while; the hourly job learns from finished sessions' } : {}) });
+  items.push({ id: 'memories', status: extracted + own > 0 ? 'ok' : 'warn',
+    detail: `${recent} memories learned in the last 7 days (${extracted} in all)`
+      + (own ? `, plus ${own} saved by Claude Code` : ''),
+    ...(extracted + own === 0 ? { fix: 'use Claude Code or Codex for a while; the hourly job learns from finished sessions' } : {}) });
 
   // 4. Mirror into the vault, and the index.
   const vault = env.KG_VAULT_PATH ?? join(home, 'claude-vault/vault');
