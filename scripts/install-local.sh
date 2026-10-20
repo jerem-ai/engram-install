@@ -454,6 +454,8 @@ purge() {
     # --no-session-persistence, under a project named for its engram-extract- temp dir.
     for f in "$CLAUDE_DIR/projects"/*-engram-extract-*; do remove "$f"; done
   fi
+  # The recall hooks' own logs and receipts.
+  for f in "$CLAUDE_DIR/logs/engram-recall"* "$CODEX_DIR/logs/engram-recall"*; do remove "$f"; done
   remove "$ENGRAM_HOME"
   remove "$CONF"
   [ "$created_claude" = true ] && remove "$CLAUDE_DIR"
