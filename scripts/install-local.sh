@@ -445,9 +445,14 @@ purge() {
   parents=$(sed -nE 's/.*"created_parents": *"([^"]*)".*/\1/p' "$MANIFEST" 2>/dev/null)
   uninstall
   # Memories the extractor wrote carry extractor_model cli/<driver>; Claude Code's own
-  # memory files in the same folders are left alone.
+  # memory files in the same folders are left alone. grep exits 1 when it finds none,
+  # which pipefail would turn into a silent exit before ~/Engram and the config go.
   if [ -d "$CLAUDE_DIR/projects" ]; then
-    grep -rl --include='*.md' '^  extractor_model: cli/' "$CLAUDE_DIR/projects" 2>/dev/null | while read -r f; do remove "$f"; done
+    { grep -rl --include='*.md' '^  extractor_model: cli/' "$CLAUDE_DIR/projects" 2>/dev/null || true; } \
+      | while read -r f; do remove "$f"; done
+    # Claude Code leaves a title stub for each extractor call, even with
+    # --no-session-persistence, under a project named for its engram-extract- temp dir.
+    for f in "$CLAUDE_DIR/projects"/*-engram-extract-*; do remove "$f"; done
   fi
   remove "$ENGRAM_HOME"
   remove "$CONF"
