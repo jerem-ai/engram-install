@@ -32,6 +32,10 @@ Install Engram for me from GitHub and check that it works:
    Tell me to come back and say "done" when it finishes. Then check again.
 2. Install the tools with the brew that exists, by its full path (it may not be on
    PATH yet): <full path to brew> install git node@22 python@3.12
+   If brew says it cannot write to its folder (another account on this Mac owns
+   Homebrew), check <Homebrew folder>/opt for git, node@22 and python@3.12. If all
+   three are there, carry on. If one is missing, tell me to ask whoever set up
+   Homebrew to run the same brew install line, and stop.
 3. Run, with the git from that same Homebrew folder:
    <Homebrew folder>/bin/git clone https://github.com/jerem-ai/engram-install.git ~/Engram/src
 4. Run: ~/Engram/src/scripts/install-local.sh

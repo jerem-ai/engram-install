@@ -69,18 +69,27 @@ export function factLinkKey(sourceNodeId: string, a: AssertionTriple): string {
     .digest('hex').slice(0, 32);
 }
 
-/** The latest fact-link record for this assertion, or null. */
-export function findFactLink(path: string, key: string): Json | null {
+/**
+ * The latest fact-link record for this assertion, or null. An admitted engram_remember
+ * fact is stored against its reviewed note (Memory/Engram/Reviewed/...), not the session
+ * log the linker keyed it by, so a record whose subject, predicate and object match is
+ * used when no record carries the exact key.
+ */
+export function findFactLink(path: string, key: string, a?: AssertionTriple): Json | null {
   if (!existsSync(path)) return null;
-  let found: Json | null = null;
+  const n = (v: unknown) => String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  let exact: Json | null = null;
+  let byFact: Json | null = null;
   for (const line of readFileSync(path, 'utf8').split('\n')) {
-    if (!line.includes(key)) continue;
+    if (!line.trim()) continue;
     try {
       const rec = JSON.parse(line) as Json;
-      if (rec.schema === 'engram.fact-link.v1' && rec.key === key) found = rec;
+      if (rec.schema !== 'engram.fact-link.v1') continue;
+      if (rec.key === key) exact = rec;
+      else if (a && n(rec.subject) === n(a.subject) && n(rec.predicate) === n(a.predicate) && n(rec.object) === n(a.object)) byFact = rec;
     } catch {}
   }
-  return found;
+  return exact ?? byFact;
 }
 
 export function transcriptIndexPath(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
@@ -265,7 +274,7 @@ export function buildProvenance(frontmatter: Json, assertion: AssertionTriple, o
   let link: Provenance['link'];
   let session = sourceSession;
   if (!passages.length && assertion.source_node_id) {
-    const rec = findFactLink(factLinksPath(opts.env ?? process.env, opts.home ?? homedir()), factLinkKey(assertion.source_node_id, assertion));
+    const rec = findFactLink(factLinksPath(opts.env ?? process.env, opts.home ?? homedir()), factLinkKey(assertion.source_node_id, assertion), assertion);
     if (rec && typeof rec.support === 'string') {
       const supported = rec.support === 'supported' && strings(rec.passages).length > 0;
       if (supported) { passages = strings(rec.passages); passagesScope = 'link'; }
