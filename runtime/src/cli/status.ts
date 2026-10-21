@@ -3,7 +3,7 @@ import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, s
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { readEngramEnv, type EngramEnv } from '../lib/install-config.js';
+import { engramEnvPath, readEngramEnv, type EngramEnv } from '../lib/install-config.js';
 import { runEngramHealthChecks, type IndexerStats } from '../lib/engram/health.js';
 
 /**
@@ -108,6 +108,10 @@ export async function engramStatusReport(opts: StatusOptions = {}): Promise<Stat
       ? { id: 'backend', status: 'ok', detail: `extraction uses your ${driver} login` }
       : { id: 'backend', status: 'fail', detail: `${driver} is not logged in, so nothing new is learned`,
           fix: driver === 'claude' ? 'run `claude`, then type /login' : 'run `codex login`' });
+  } else if (!existsSync(engramEnvPath(home))) {
+    // No engram.env: an operator machine, not an install. Reinstalling would be the wrong fix.
+    items.push({ id: 'backend', status: 'ok',
+      detail: 'no engram.env, so not an install: run-memory-extraction.sh uses its own default backend' });
   } else {
     items.push({ id: 'backend', status: 'warn', detail: `extraction backend is ${env.ENGRAM_EXTRACT_BACKEND ?? 'not set'}`,
       fix: 'rerun scripts/install-local.sh' });

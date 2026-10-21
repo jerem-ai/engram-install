@@ -227,11 +227,27 @@ def is_agent_session(conv, extra_signatures=()) -> bool:
     return False
 
 
-def build_transcript(conv) -> str:
+# Harness envelopes are not the user's words: Conductor opens every workspace with a
+# <system_instruction> block, and reminders arrive as <system-reminder>. Only whole
+# blocks on their own lines go, so a question that names the tag inline stays (the
+# recall hook's rule, runtime/hooks/recall-core.mjs, adjudication batch-001 C04). The
+# codex driver read a session that opens with one as an agent run and returned nothing
+# (Gate 2, October 17), so the cli backend strips them from user turns.
+ENVELOPE = re.compile(r"^[ \t]*<(system_instruction|system-reminder)>[\s\S]*?</\1>[ \t]*$", re.M)
+
+
+def strip_envelopes(text: str) -> str:
+    return ENVELOPE.sub(" ", text)
+
+
+def build_transcript(conv, envelopes: bool = True) -> str:
+    """The transcript the model reads. `envelopes=False` drops harness envelopes from user turns."""
     parts = []
     for m in conv.messages:
         role = "User" if m.role in ("human", "user") else "Claude"
         content = strip_tools(m.content or "").strip()
+        if not envelopes and role == "User":
+            content = strip_envelopes(content).strip()
         if not content:
             continue
         if len(content) > MAX_MSG_CHARS:
@@ -854,7 +870,7 @@ def cli_preflight(driver: str, model: str = "") -> None:
 
 
 def call_ollama(url, model, think, system, user_block, timeout=600, temperature=0.2,
-                num_ctx=32768):
+                num_ctx=32768, num_predict=None, fmt=None):
     # Context overflow is SILENT and catastrophic here. Ollama truncates from the
     # front, which discards the system prompt, so the model stops being an extractor
     # and just continues the transcript in first person. Verified 2026-08-01 on
@@ -872,6 +888,12 @@ def call_ollama(url, model, think, system, user_block, timeout=600, temperature=
             {"role": "user", "content": user_block},
         ],
     }
+    # Optional, for callers that bound the reply (output counts against num_ctx)
+    # or constrain it to a JSON schema; the extractor passes neither.
+    if num_predict is not None:
+        payload["options"]["num_predict"] = num_predict
+    if fmt is not None:
+        payload["format"] = fmt
     req = urllib.request.Request(
         f"{url}/api/chat",
         data=json.dumps(payload).encode(),
@@ -901,7 +923,7 @@ def call_ollama(url, model, think, system, user_block, timeout=600, temperature=
 
 
 def call_openai(base_url, model, system, user_block, timeout=600, temperature=0.2,
-                response_schema=None, response_name="response"):
+                response_schema=None, response_name="response", max_tokens=None):
     """OpenAI-compatible chat-completions backend (e.g. the operator's gateway
     at http://127.0.0.1:8790/v1, where `model` is a lane id).
     Mirrors call_ollama's hard SIGALRM deadline so a slow-trickle frontier
@@ -915,6 +937,8 @@ def call_openai(base_url, model, system, user_block, timeout=600, temperature=0.
             {"role": "user", "content": user_block},
         ],
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     if response_schema is not None:
         payload["response_format"] = {
             "type": "json_schema",
@@ -962,7 +986,7 @@ def extract_conv(cfg, conv, session_id, mem_dir, model_hint, runtime, dry):  # b
     # The cli backend also refuses its own extraction calls, should one ever be persisted.
     if (is_agent_session(conv, CLI_SELF_SIGNATURES) if cfg["backend"] == "cli" else is_agent_session(conv)):
         return 0, []  # automated agent/heartbeat run — skip, no model call
-    transcript = build_transcript(conv)
+    transcript = build_transcript(conv, envelopes=False) if cfg["backend"] == "cli" else build_transcript(conv)
     if len(transcript) < 200:
         return 0, []
     user_block = (

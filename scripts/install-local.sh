@@ -121,6 +121,23 @@ if [ -z "${ENGRAM_NODE:-}" ] && ! is_node22 "$NODE"; then
 fi
 PY312="$(command -v python3.12 || true)"
 CLAUDE_BIN="$(command -v claude || true)"
+# Claude Code's own installer puts claude in ~/.local/bin, which a shell another app
+# starts (the Codex app's, for one) may not have on PATH.
+[ -z "$CLAUDE_BIN" ] && [ -x "$HOME/.local/bin/claude" ] && CLAUDE_BIN="$HOME/.local/bin/claude"
+# The Claude desktop app runs its own copy of Claude Code, with no claude on PATH. It
+# reads the same ~/.claude.json and ~/.claude/settings.json, so its newest copy can
+# register the MCP server and hook. Registration only: its path changes every update,
+# so it is never the extraction driver or on the launch agents' PATH.
+CLAUDE_REG_BIN="$CLAUDE_BIN"
+if [ -z "$CLAUDE_REG_BIN" ]; then
+  desktop_cc="$HOME/Library/Application Support/Claude/claude-code"
+  newest=$({ ls "$desktop_cc" 2>/dev/null || true; } | sort -V | tail -1)
+  if [ -n "$newest" ]; then
+    for b in "$desktop_cc/$newest"/*/claude.app/Contents/MacOS/claude; do
+      if [ -x "$b" ]; then CLAUDE_REG_BIN="$b"; fi
+    done
+  fi
+fi
 CODEX_BIN="$(command -v codex || true)"
 
 if [ "$MODE" = install ]; then
@@ -327,9 +344,9 @@ load_agents() {
 }
 
 register_clients() {
-  if [ -n "$CLAUDE_BIN" ]; then
-    [ "$DRY" -eq 1 ] || "$CLAUDE_BIN" mcp remove -s user "$MCP_NAME" >/dev/null 2>&1 || true
-    act "$CLAUDE_BIN" mcp add -s user "$MCP_NAME" -- /bin/zsh "$CURRENT/runtime/scripts/run-claude-engram-mcp.sh"
+  if [ -n "$CLAUDE_REG_BIN" ]; then
+    [ "$DRY" -eq 1 ] || "$CLAUDE_REG_BIN" mcp remove -s user "$MCP_NAME" >/dev/null 2>&1 || true
+    act "$CLAUDE_REG_BIN" mcp add -s user "$MCP_NAME" -- /bin/zsh "$CURRENT/runtime/scripts/run-claude-engram-mcp.sh"
     act "$NODE" "$CURRENT/runtime/scripts/install-claude-recall-hook.mjs" --settings "$CLAUDE_DIR/settings.json" \
       --runtime "$CURRENT/runtime" --node "$NODE"
   fi
@@ -405,9 +422,9 @@ uninstall() {
   node_for=$(sed -n 's/^ENGRAM_NODE=//p' "$CONF/engram.env" 2>/dev/null)
   node_for=${node_for:-${NODE:-node}}
   local runner=${NODE:-$node_for}
-  if [ -n "$CLAUDE_BIN" ]; then
-    if [ "$DRY" -eq 1 ]; then say "[dry-run] $CLAUDE_BIN mcp remove -s user $MCP_NAME"
-    else "$CLAUDE_BIN" mcp remove -s user "$MCP_NAME" >/dev/null 2>&1 && say "- removed Claude MCP server $MCP_NAME" || true; fi
+  if [ -n "$CLAUDE_REG_BIN" ]; then
+    if [ "$DRY" -eq 1 ]; then say "[dry-run] $CLAUDE_REG_BIN mcp remove -s user $MCP_NAME"
+    else "$CLAUDE_REG_BIN" mcp remove -s user "$MCP_NAME" >/dev/null 2>&1 && say "- removed Claude MCP server $MCP_NAME" || true; fi
   fi
   if [ -n "$CODEX_BIN" ]; then
     if [ "$DRY" -eq 1 ]; then say "[dry-run] $CODEX_BIN mcp remove $MCP_NAME"
