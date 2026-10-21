@@ -214,4 +214,24 @@ if [ -r "$SCRIPT_DIR/backfill_claims.py" ] \
   "$PY" "$SCRIPT_DIR/backfill_claims.py" --limit "${ENGRAM_CLAIM_BACKFILL_CALLS:-60}" \
     || echo "[$(date '+%F %T')] WARN: claim backfill exited $?"
 fi
+# Note claims (October 20, OBSERVE.md 15g): typed claims for session logs, topics, ideas and
+# conversations, kept in note-claims.jsonl because those notes take appended footers only.
+# Same lanes as the backfill; ENGRAM_NOTE_CLAIMS_RUN=off disables it. Runs before the review
+# so tonight's claims are judged tonight. A failure never fails extraction.
+NOTE_CLAIMS_RUN="${ENGRAM_NOTE_CLAIMS_RUN:-}"
+if [ -r "$SCRIPT_DIR/note_claims.py" ] \
+    && { [ "$NOTE_CLAIMS_RUN" = on ] || { [ -z "$NOTE_CLAIMS_RUN" ] && [ "$BACKEND" = openai ]; }; }; then
+  "$PY" "$SCRIPT_DIR/note_claims.py" --limit "${ENGRAM_NOTE_CLAIMS_CALLS:-40}" \
+    || echo "[$(date '+%F %T')] WARN: note claims exited $?"
+fi
+# Per-claim review (October 20, OBSERVE.md 15f): a verdict for each typed claim, judged on
+# its own passages, appended to claim-verdicts.jsonl (the hourly archive job copies it to
+# the mini). Same lanes as the backfill; ENGRAM_CLAIM_REVIEW=off disables it. Capped at
+# ENGRAM_CLAIM_REVIEW_CALLS model calls a run; a failure never fails extraction.
+CLAIM_REVIEW="${ENGRAM_CLAIM_REVIEW:-}"
+if [ -r "$SCRIPT_DIR/review_claims.py" ] \
+    && { [ "$CLAIM_REVIEW" = on ] || { [ -z "$CLAIM_REVIEW" ] && [ "$BACKEND" = openai ]; }; }; then
+  "$PY" "$SCRIPT_DIR/review_claims.py" --limit "${ENGRAM_CLAIM_REVIEW_CALLS:-120}" \
+    || echo "[$(date '+%F %T')] WARN: claim review exited $?"
+fi
 echo "[$(date '+%F %T')] memory-extraction done"

@@ -3,6 +3,8 @@ import type Database from 'better-sqlite3';
 import type { VaultWriter } from '../writer.js';
 import { insertAssertion, type EngramAssertion } from './assertions.js';
 import { normalizeTemporalInstant } from './temporal.js';
+import { claimUnsupported, fileClaimVerdicts, type ClaimVerdictLookup } from './claim-verdicts.js';
+import { NOTE_CLAIMS_PREFIX, fileNoteClaims, findNoteClaim, type NoteClaimsLookup } from './note-claims.js';
 import type { ToolAuthorizer } from '../../security/authorization.js';
 import type { VerifiedRequestIdentity } from '../../security/request-identity.js';
 
@@ -145,6 +147,10 @@ export interface MemoryAdmissionServiceOptions {
   now?: () => number;
   /** Admit agent-written facts automatically on submission and indexing. The production factory turns this on. */
   selfAdmission?: boolean;
+  /** Per-claim review verdicts (claim-verdicts.ts). Default: the sidecar file; only qualified verdicts count. */
+  claimVerdicts?: ClaimVerdictLookup;
+  /** Typed claims for vault notes (note-claims.ts). Default: the sidecar file. */
+  noteClaims?: NoteClaimsLookup;
 }
 
 export interface CandidateInput {
@@ -159,7 +165,7 @@ export interface CandidateInput {
 
 export type SelfAdmissionHold =
   | 'not_found' | 'not_quarantined' | 'not_agent_derived' | 'source_unbound' | 'source_missing'
-  | 'invalid_validity' | 'future_validity' | 'needs_writer' | 'source_unsupported';
+  | 'invalid_validity' | 'future_validity' | 'needs_writer' | 'source_unsupported' | 'claim_unsupported';
 
 export type SelfAdmission =
   | { status: 'admitted'; candidateId: string; mode: 'in_place' | 'note'; assertionId: string;
@@ -191,12 +197,16 @@ export type CandidateSubmission =
 
 export class MemoryAdmissionService {
   private readonly now: () => number;
+  private readonly claimVerdicts: ClaimVerdictLookup;
+  readonly noteClaims: NoteClaimsLookup;
 
   constructor(private readonly options: MemoryAdmissionServiceOptions) {
     if (options.receiptKey.byteLength < 32) {
       throw new Error('Memory admission receipt key must be at least 32 bytes');
     }
     this.now = options.now ?? Date.now;
+    this.claimVerdicts = options.claimVerdicts ?? fileClaimVerdicts();
+    this.noteClaims = options.noteClaims ?? fileNoteClaims();
   }
 
   get selfAdmission(): boolean {
@@ -306,20 +316,27 @@ export class MemoryAdmissionService {
     }
     if (candidate.origin !== 'model_derived') return held('not_agent_derived');
     const extracted = candidate.source_hash.startsWith('extracted-v1:');
+    // A vault note's claim from the note-claims sidecar is admitted in place the same way.
+    const noteClaim = candidate.source_hash.startsWith(NOTE_CLAIMS_PREFIX);
     let evidence: CandidateEvidence | null = null;
-    if (extracted) {
-      try { evidence = getMemoryCandidateEvidence(db, candidate); } catch { return held('source_unbound'); }
+    if (extracted || noteClaim) {
+      try {
+        evidence = extracted ? getMemoryCandidateEvidence(db, candidate) : getNoteClaimEvidence(db, candidate, this.noteClaims);
+      } catch { return held('source_unbound'); }
       if (!evidence) return held('source_unbound');
       // Phase 5: the write-time support judge found the memory's cited passages do not back it
       // (extraction/support_check.py). Its claims stay quarantined; `unchecked` is not a verdict.
       if (memorySupportVerdict(db, candidate.source_node_id) === 'unsupported') return held('source_unsupported');
+      // Per-claim review: a qualified reviewer found this claim's own passages do not back it.
+      if (claimUnsupported(this.claimVerdicts, evidence.source_node_id, candidate as { subject: string; predicate: string; object: string },
+        evidence.passages)) return held('claim_unsupported');
     } else {
       // The candidate note Engram writes for a submission (EngramCandidates/) is
       // not evidence; before 2026-10-04 every source-less fact cited one and passed.
       const source = resolveSourceNode(db, candidate.source_node_id);
       if (!source || source.startsWith('EngramCandidates/')) return held('source_missing');
     }
-    const mode = extracted ? 'in_place' as const : 'note' as const;
+    const mode = extracted || noteClaim ? 'in_place' as const : 'note' as const;
     if (mode === 'note' && !opts.writer) return held('needs_writer');
 
     const now = new Date(this.now()).toISOString();
@@ -413,7 +430,7 @@ export class MemoryAdmissionService {
     w: AdmissionWrite,
   ): { assertion: EngramAssertion; sourceNodeId: string } {
     return db.transaction(() => {
-      if (w.evidence && candidate.source_hash !== `extracted-v1:${computeMemorySourceDigest(db, candidate.source_node_id!)}`) {
+      if (w.evidence && candidate.source_hash !== `${bindingPrefix(candidate.source_hash)}${computeMemorySourceDigest(db, candidate.source_node_id!)}`) {
         throw new Error('Candidate source changed during review');
       }
       if (w.checkExistingValidity && w.status === 'current') {
@@ -649,7 +666,8 @@ export function memorySourceGate(
     if (!ok && mode === 'admitted') {
       inPlace ??= inPlaceAdmittedHashes(db);
       const hashes = inPlace.get(sourceNodeId);
-      ok = !!hashes && hashes.has(`extracted-v1:${computeMemorySourceDigest(db, sourceNodeId)}`);
+      const digest = computeMemorySourceDigest(db, sourceNodeId);
+      ok = !!hashes && (hashes.has(`extracted-v1:${digest}`) || hashes.has(`${NOTE_CLAIMS_PREFIX}${digest}`));
     }
     seen.set(sourceNodeId, ok);
     return ok;
@@ -662,13 +680,14 @@ export function admittedSourceSql(column: string, mode: 'promoted_only' | 'admit
     AND ms.trust_state = 'promoted' AND ms.authority = 'informational_only')`;
   if (mode === 'promoted_only') return promoted;
   return `(${promoted} OR EXISTS (SELECT 1 FROM engram_memory_candidates mc WHERE mc.source_node_id = ${column}
-    AND mc.trust_state = 'promoted' AND mc.source_hash LIKE 'extracted-v1:%'))`;
+    AND mc.trust_state = 'promoted' AND (mc.source_hash LIKE 'extracted-v1:%' OR mc.source_hash LIKE '${NOTE_CLAIMS_PREFIX}%')))`;
 }
 
 function inPlaceAdmittedHashes(db: Database.Database): Map<string, Set<string>> {
   const rows = db.prepare(`
     SELECT source_node_id, source_hash FROM engram_memory_candidates
-    WHERE trust_state = 'promoted' AND source_hash LIKE 'extracted-v1:%' AND source_node_id IS NOT NULL
+    WHERE trust_state = 'promoted' AND (source_hash LIKE 'extracted-v1:%' OR source_hash LIKE '${NOTE_CLAIMS_PREFIX}%')
+      AND source_node_id IS NOT NULL
   `).all() as Array<{ source_node_id: string; source_hash: string }>;
   const out = new Map<string, Set<string>>();
   for (const r of rows) {
@@ -691,6 +710,38 @@ export function computeMemorySourceDigest(db: Database.Database, sourceNodeId: s
     .update(source.content ?? '').update('\0')
     .update(source.frontmatter)
     .digest('hex');
+}
+
+/** The binding prefix of an in-place candidate's source hash. */
+function bindingPrefix(sourceHash: string): string {
+  return sourceHash.startsWith(NOTE_CLAIMS_PREFIX) ? NOTE_CLAIMS_PREFIX : 'extracted-v1:';
+}
+
+/**
+ * Evidence for a vault note's claim from the note-claims sidecar: bound to the note's
+ * current digest, and only while every quoted passage is still in the note.
+ */
+export function getNoteClaimEvidence(db: Database.Database, candidate: MemoryCandidate, lookup: NoteClaimsLookup) {
+  if (!candidate.source_hash.startsWith(NOTE_CLAIMS_PREFIX)) return null;
+  return db.transaction(() => {
+    if (!candidate.source_node_id || candidate.source_hash !== `${NOTE_CLAIMS_PREFIX}${computeMemorySourceDigest(db, candidate.source_node_id)}`) {
+      throw new Error('Candidate source changed or disappeared; review a newly submitted candidate');
+    }
+    const node = db.prepare('SELECT frontmatter, content FROM nodes WHERE id=?').get(candidate.source_node_id) as
+      { frontmatter: string; content: string | null };
+    const claim = findNoteClaim(lookup, candidate.source_node_id,
+      { subject: candidate.subject!, predicate: candidate.predicate!, object: candidate.object! }, node.content ?? '');
+    if (!claim) throw new Error('The note no longer holds every passage this claim quotes');
+    const fm = JSON.parse(node.frontmatter);
+    const rec = lookup(candidate.source_node_id);
+    const evidence = { source_node_id: candidate.source_node_id, source_hash: candidate.source_hash,
+      source_session: typeof fm.session_id === 'string' ? fm.session_id : rec?.session_id ?? null,
+      source_created: fm.created ?? fm.date ?? null,
+      valid_from: claim.valid_from ?? null, valid_to: claim.valid_to ?? null,
+      passages: claim.passages, authority: MEMORY_AUTHORITY };
+    if (containsCredential(JSON.stringify(evidence))) throw new Error('Credential-shaped source evidence cannot be promoted');
+    return evidence;
+  })();
 }
 
 /** Full-source evidence for new extracted claims. Legacy prefix hashes cannot certify it. */

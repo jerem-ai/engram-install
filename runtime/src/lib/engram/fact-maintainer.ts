@@ -3,6 +3,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { SELF_ADMISSION_POLICY_VERSION, SELF_ADMISSION_REASON } from './admission.js';
+import { claimUnsupported, fileClaimVerdicts, type ClaimVerdictLookup } from './claim-verdicts.js';
+import { NOTE_CLAIMS_PREFIX, fileNoteClaims, findNoteClaim, type NoteClaimsLookup } from './note-claims.js';
 
 /**
  * The fact maintainer keeps the self-admitted assertion layer honest without a
@@ -22,6 +24,10 @@ import { SELF_ADMISSION_POLICY_VERSION, SELF_ADMISSION_REASON } from './admissio
  *   target) is a graph edge, not a fact (ENGRAM.md: relations are topology).
  *   A June 23 derivation made 4,758 of them; it becomes retracted. The edge
  *   itself stays in the graph.
+ * - retire unsupported claims: a current fact from a memory note's typed claim
+ *   that a qualified per-claim reviewer found its own passages do not back
+ *   (claim-verdicts.ts, OBSERVE.md 15f) becomes retracted. A verdict for other
+ *   passages, or from an unqualified reviewer, retires nothing.
  *
  * The Kipp judge (fact-judge.ts) writes `judge_supersede` actions through the
  * same receipts and revert.
@@ -58,7 +64,8 @@ export type MaintenanceAction =
       twin_id: string | null; prior: CandidateState; after: CandidateState }
   | { kind: 'judge_supersede'; assertion_id: string; winner_id: string; verdict: 'conflict' | 'duplicate';
       group: string; prior: AssertionState; after: AssertionState }
-  | { kind: 'retire_link'; assertion_id: string; prior: AssertionState; after: AssertionState };
+  | { kind: 'retire_link'; assertion_id: string; prior: AssertionState; after: AssertionState }
+  | { kind: 'retire_unsupported'; assertion_id: string; prior: AssertionState; after: AssertionState };
 
 export interface MaintenanceReceipt {
   schema: typeof MAINTENANCE_RECEIPT_SCHEMA;
@@ -74,13 +81,23 @@ export interface MaintenanceReceipt {
 }
 
 type Triple = { subject: string; predicate: string; object: string };
-type SourceKind = 'extracted' | 'note';
+type SourceKind = 'extracted' | 'note' | 'note_claims';
 type Support = 'present' | 'dropped' | 'gone';
 
-/** Does the source still state this exact claim? Same trimmed comparison admission uses. */
-export function sourceSupport(db: Database.Database, nodeId: string, kind: SourceKind, t: Triple): Support {
-  const node = db.prepare('SELECT frontmatter FROM nodes WHERE id = ?').get(nodeId) as { frontmatter: string } | undefined;
+/**
+ * Does the source still state this exact claim? Same trimmed comparison admission uses.
+ * A vault note's sidecar claim (`note_claims`) stands while the sidecar holds it and every
+ * passage it quotes is still in the note.
+ */
+export function sourceSupport(db: Database.Database, nodeId: string, kind: SourceKind, t: Triple,
+  notes: NoteClaimsLookup = fileNoteClaims()): Support {
+  const node = db.prepare('SELECT frontmatter, content FROM nodes WHERE id = ?').get(nodeId) as
+    { frontmatter: string; content: string | null } | undefined;
   if (!node) return 'gone';
+  if (kind === 'note_claims') {
+    const claim = findNoteClaim(notes, nodeId, t, node.content ?? '');
+    return claim && !(typeof claim.valid_to === 'string' && claim.valid_to.trim()) ? 'present' : 'dropped';
+  }
   let fm: Record<string, unknown>;
   try { fm = JSON.parse(node.frontmatter); } catch { return 'dropped'; }
   const blocks = kind === 'extracted'
@@ -126,6 +143,7 @@ function supportedAssertions(db: Database.Database, statuses: string[]): Map<str
 function candidateSource(r: SupportRow): { node: string; kind: SourceKind } | null {
   if (r.note) return { node: r.note, kind: 'note' };
   if (r.chash.startsWith('extracted-v1:') && r.csrc) return { node: r.csrc, kind: 'extracted' };
+  if (r.chash.startsWith(NOTE_CLAIMS_PREFIX) && r.csrc) return { node: r.csrc, kind: 'note_claims' };
   return null;
 }
 
@@ -134,7 +152,7 @@ function candidateSource(r: SupportRow): { node: string; kind: SourceKind } | nu
  * alone: a human-reviewed candidate backs it, or the row is owned by a source
  * no self-admitted candidate binds (a legacy row the claim coalesced into).
  */
-function assertionSupport(db: Database.Database, rows: SupportRow[]): Support | null {
+function assertionSupport(db: Database.Database, rows: SupportRow[], notes: NoteClaimsLookup): Support | null {
   if (rows.some(r => r.creason !== SELF_ADMISSION_REASON)) return null;
   const sources = rows.map(candidateSource);
   if (sources.some(s => s === null)) return null;
@@ -145,7 +163,7 @@ function assertionSupport(db: Database.Database, rows: SupportRow[]): Support | 
   for (const s of sources as Array<{ node: string; kind: SourceKind }>) {
     if (seen.has(`${s.kind}\u001f${s.node}`)) continue;
     seen.add(`${s.kind}\u001f${s.node}`);
-    const support = sourceSupport(db, s.node, s.kind, rows[0]);
+    const support = sourceSupport(db, s.node, s.kind, rows[0], notes);
     if (support === 'present') return 'present';
     if (support === 'dropped') gone = false;
   }
@@ -165,10 +183,11 @@ function endAt(now: string, validFrom: string | null): string {
  * Plan source-follow. `retired` maps assertion ids this rule retired in an
  * unreverted run to the state it left them in; only those are restored.
  */
-export function planSourceFollow(db: Database.Database, now: string, retired: Map<string, AssertionState>): MaintenanceAction[] {
+export function planSourceFollow(db: Database.Database, now: string, retired: Map<string, AssertionState>,
+  notes: NoteClaimsLookup = fileNoteClaims()): MaintenanceAction[] {
   const actions: MaintenanceAction[] = [];
   for (const [id, rows] of supportedAssertions(db, ['current'])) {
-    const support = assertionSupport(db, rows);
+    const support = assertionSupport(db, rows, notes);
     if (support === null || support === 'present') continue;
     const prior = stateOf(rows[0]);
     actions.push({
@@ -183,7 +202,7 @@ export function planSourceFollow(db: Database.Database, now: string, retired: Ma
       const prior = stateOf(rows[0]);
       // Re-indexing the file touches updated_at on the retired row; status and end must still be ours.
       if (!left || left.status !== prior.status || left.valid_to !== prior.valid_to || left.superseded_by !== prior.superseded_by) continue;
-      if (assertionSupport(db, rows) !== 'present') continue;
+      if (assertionSupport(db, rows, notes) !== 'present') continue;
       // Another source may hold this claim as current now; one current row per triple.
       const taken = db.prepare(`SELECT 1 FROM engram_assertions WHERE owner_principal_id = current_principal_id()
         AND subject = ? AND predicate = ? AND object = ? AND status = 'current' AND id != ?`)
@@ -197,10 +216,10 @@ export function planSourceFollow(db: Database.Database, now: string, retired: Ma
 }
 
 /** Plan retirement of quarantined extracted claims that can never be admitted. */
-export function planCandidateRetirement(db: Database.Database, now: string): MaintenanceAction[] {
+export function planCandidateRetirement(db: Database.Database, now: string, notes: NoteClaimsLookup = fileNoteClaims()): MaintenanceAction[] {
   const principal = (db.prepare('SELECT current_principal_id() AS p').get() as { p: string }).p;
   const rows = db.prepare(`
-    SELECT q.id, q.subject, q.predicate, q.object, q.source_node_id, q.trust_state, q.review_reason,
+    SELECT q.id, q.subject, q.predicate, q.object, q.source_node_id, q.source_hash, q.trust_state, q.review_reason,
            q.reviewed_at, q.reviewed_by_principal_id, q.updated_at,
            (SELECT t.id FROM records_engram_memory_candidates t
              WHERE t.tenant_id = q.tenant_id AND t.owner_principal_id = q.owner_principal_id
@@ -210,15 +229,16 @@ export function planCandidateRetirement(db: Database.Database, now: string): Mai
     FROM records_engram_memory_candidates q
     WHERE q.tenant_id = current_tenant_id() AND q.owner_principal_id = current_principal_id()
       AND q.trust_state = 'quarantined' AND q.origin = 'model_derived'
-      AND q.source_hash LIKE 'extracted-v1:%' AND q.source_node_id IS NOT NULL
+      AND (q.source_hash LIKE 'extracted-v1:%' OR q.source_hash LIKE '${NOTE_CLAIMS_PREFIX}%') AND q.source_node_id IS NOT NULL
       AND q.subject IS NOT NULL AND q.predicate IS NOT NULL AND q.object IS NOT NULL
     ORDER BY q.id
-  `).all() as Array<CandidateState & Triple & { id: string; source_node_id: string; twin_id: string | null }>;
+  `).all() as Array<CandidateState & Triple & { id: string; source_node_id: string; source_hash: string; twin_id: string | null }>;
   const actions: MaintenanceAction[] = [];
   for (const r of rows) {
     let reason: typeof RETIRED_TWIN | typeof RETIRED_DROPPED;
     if (r.twin_id) reason = RETIRED_TWIN;
-    else if (sourceSupport(db, r.source_node_id, 'extracted', r) !== 'present') reason = RETIRED_DROPPED;
+    else if (sourceSupport(db, r.source_node_id, r.source_hash.startsWith(NOTE_CLAIMS_PREFIX) ? 'note_claims' : 'extracted', r, notes)
+      !== 'present') reason = RETIRED_DROPPED;
     else continue;
     const prior: CandidateState = { trust_state: r.trust_state, review_reason: r.review_reason, reviewed_at: r.reviewed_at,
       reviewed_by_principal_id: r.reviewed_by_principal_id, updated_at: r.updated_at };
@@ -261,6 +281,38 @@ export function planLinkRetirement(db: Database.Database, now: string): Maintena
     if (!copies) continue;
     const prior = stateOf(r);
     actions.push({ kind: 'retire_link', assertion_id: r.id, prior,
+      after: { status: 'retracted', valid_to: prior.valid_to, superseded_by: prior.superseded_by, updated_at: now } });
+  }
+  return actions;
+}
+
+/**
+ * Plan retirement of current facts whose typed claim a qualified per-claim reviewer
+ * found unsupported by that claim's own passages (the passages the note holds now).
+ */
+export function planClaimRetirement(db: Database.Database, now: string, lookup: ClaimVerdictLookup,
+  notes: NoteClaimsLookup = fileNoteClaims()): MaintenanceAction[] {
+  const rows = db.prepare(`
+    SELECT a.id, a.subject, a.predicate, a.object, a.source_node_id, a.status, a.valid_to, a.superseded_by,
+      a.updated_at, n.frontmatter, n.content
+    FROM engram_assertions a
+    JOIN nodes n ON n.id = a.source_node_id
+    WHERE a.owner_principal_id = current_principal_id() AND a.status = 'current'
+  `).all() as Array<Triple & { id: string; source_node_id: string; status: string; valid_to: string | null;
+    superseded_by: string | null; updated_at: string; frontmatter: string; content: string | null }>;
+  const actions: MaintenanceAction[] = [];
+  for (const r of rows) {
+    let claims: unknown;
+    try { claims = (JSON.parse(r.frontmatter) as { metadata?: { assertions?: unknown } }).metadata?.assertions; } catch { continue; }
+    const claim = (Array.isArray(claims) ? claims : []).find((c: Record<string, unknown>) => c && typeof c.subject === 'string' && c.subject.trim() === r.subject
+      && typeof c.predicate === 'string' && c.predicate.trim() === r.predicate
+      && typeof c.object === 'string' && c.object.trim() === r.object) as { passages?: unknown } | undefined;
+    // A vault note's claim lives in the note-claims sidecar instead of its frontmatter.
+    const passages = claim?.passages ?? findNoteClaim(notes, r.source_node_id, r, r.content ?? '')?.passages;
+    if (!Array.isArray(passages) || !passages.every(p => typeof p === 'string')) continue;
+    if (!claimUnsupported(lookup, r.source_node_id, r, passages as string[])) continue;
+    const prior = stateOf(r);
+    actions.push({ kind: 'retire_unsupported', assertion_id: r.id, prior,
       after: { status: 'retracted', valid_to: prior.valid_to, superseded_by: prior.superseded_by, updated_at: now } });
   }
   return actions;
@@ -385,13 +437,14 @@ export interface DeterministicRunResult {
  */
 export function runDeterministicMaintenance(
   db: Database.Database,
-  opts: { dir?: string; now?: string; dryRun?: boolean } = {},
+  opts: { dir?: string; now?: string; dryRun?: boolean; claimVerdicts?: ClaimVerdictLookup; noteClaims?: NoteClaimsLookup } = {},
 ): DeterministicRunResult {
   const dir = opts.dir ?? factMaintainerDir();
   const now = opts.now ?? new Date().toISOString();
   const id = runId('det', now);
-  const planned = [...planSourceFollow(db, now, retiredBySourceFollow(dir)), ...planCandidateRetirement(db, now),
-    ...planLinkRetirement(db, now)];
+  const notes = opts.noteClaims ?? fileNoteClaims();
+  const planned = [...planSourceFollow(db, now, retiredBySourceFollow(dir), notes), ...planCandidateRetirement(db, now, notes),
+    ...planLinkRetirement(db, now), ...planClaimRetirement(db, now, opts.claimVerdicts ?? fileClaimVerdicts(), notes)];
   if (opts.dryRun) return { run_id: id, dry_run: true, counts: countActions(planned), applied: 0, skipped: 0, receipt: null };
   const result = db.transaction(() => {
     const applied = planned.filter(a => applyAction(db, a));

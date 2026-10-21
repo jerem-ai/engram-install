@@ -918,6 +918,38 @@ export class IndexPipeline {
       }
     }
 
+    // Typed claims for vault notes (session logs, topics, ideas, conversations) live in
+    // the note-claims sidecar, since those notes take appended footers only (note-claims.ts,
+    // OBSERVE.md 15g). Each is bound to the note's digest and admitted in place while every
+    // passage it quotes is still in the note.
+    if (this.memoryAdmission) {
+      const { NOTE_CLAIMS_PREFIX, standingNoteClaims } = await import('./engram/note-claims.js');
+      const lookup = this.memoryAdmission.noteClaims;
+      const notes = db.prepare(`
+        SELECT id, content FROM nodes WHERE source = 'vault'
+          AND (id LIKE 'Sessions/%' OR id LIKE 'Topics/%' OR id LIKE 'Ideas/%' OR id LIKE 'Conversations/%')
+      `).all() as Array<{ id: string; content: string | null }>;
+      for (const note of notes) {
+        const claims = standingNoteClaims(lookup, note.id, note.content ?? '');
+        if (!claims.length) continue;
+        const sourceHash = `${NOTE_CLAIMS_PREFIX}${computeMemorySourceDigest(db, note.id)}`;
+        for (const c of claims) {
+          stats.assertionsSeen++;
+          try {
+            const result = this.memoryAdmission.submit(db, {
+              origin: 'model_derived', subject: c.subject.trim(), predicate: c.predicate.trim(), object: c.object.trim(),
+              sourceNodeId: note.id, sourceHash,
+            });
+            if (result.status === 'quarantined') {
+              stats.candidates++;
+              if (this.memoryAdmission.selfAdmission
+                  && this.memoryAdmission.selfAdmit(db, result.candidate.id).status === 'admitted') stats.selfAdmitted++;
+            } else stats.rejected++;
+          } catch { stats.skipped++; }
+        }
+      }
+    }
+
     return stats;
   }
 }

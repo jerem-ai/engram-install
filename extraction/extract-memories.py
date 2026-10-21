@@ -151,6 +151,14 @@ Return [] if nothing qualifies. No prose outside the JSON."""
 SYSTEM_PROMPT = SYSTEM_PROMPT.replace("Jeremy", USER_NAME)  # two mentions, both the human
 SYSTEM_PROMPT += "\nAllowed project names: " + ", ".join(PROJECT_NAMES) + "."
 
+# The codex driver only. Codex read "Only extract signal a HUMAN ... expressed" as
+# covering every type, and returned nothing from sessions where Jeremy asked one
+# question and the assistant found the answer (Gate 2, October 20: asked why on
+# 4326614d, 4e66d53d and 537ea2fe, it quoted that rule or the standing-fact rule).
+# Claude reads the HIGH-VALUE list as covering those findings. The note says how the
+# rules apply; SYSTEM_PROMPT is unchanged for the claude driver and every other backend.
+CODEX_READING_NOTE = """HOW TO READ THE RULES ABOVE. The rule that signal must come from a HUMAN governs user and feedback memories: a preference, correction or working style must be in Jeremy's own words. It does not make a session empty because Jeremy only asked a question or pasted a handoff. When Jeremy asks for help and the assistant investigates, what the session established is project or reference material: a gotcha or constraint the assistant confirmed from command output, where a system lives and how it is set up, how it fails, a decision reached, a blocker still open. Those are standing facts when they will still hold next session, and the assistant's own words can be the passage. A proposal or guess the session never confirmed is still not a memory. Before you return no memories, read the HIGH-VALUE list again against what the assistant found.""".replace("Jeremy", USER_NAME)
+
 MEMORY_RESPONSE_SCHEMA = {
     "type": "array",
     "items": {
@@ -1010,8 +1018,9 @@ def extract_conv(cfg, conv, session_id, mem_dir, model_hint, runtime, dry):  # b
         # One retry in the same run when a reply fails validation (a passage that is not
         # verbatim, a bad field). The hourly job would retry the session next hour anyway;
         # a second failure fails the session loudly. CLI errors are never retried here.
+        system = SYSTEM_PROMPT + "\n\n" + CODEX_READING_NOTE if cfg["cli_driver"] == "codex" else SYSTEM_PROMPT
         for attempt in (1, 2):
-            items = call_cli(cfg["cli_driver"], cfg.get("cli_model", ""), SYSTEM_PROMPT, user_block)
+            items = call_cli(cfg["cli_driver"], cfg.get("cli_model", ""), system, user_block)
             try:
                 validate_items(items, transcript)
                 raw = json.dumps(items)

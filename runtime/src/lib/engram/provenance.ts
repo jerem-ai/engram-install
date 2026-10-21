@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readEngramEnv } from '../install-config.js';
+import { fileNoteClaims, noteClaimsPath } from './note-claims.js';
 
 /**
  * The provenance block engram_explain returns: which session a fact came from, the
@@ -270,10 +271,17 @@ export function buildProvenance(frontmatter: Json, assertion: AssertionTriple, o
     .filter((a): a is Json => !!a && typeof a === 'object')
     .find(a => norm(a.subject) === norm(assertion.subject) && norm(a.predicate) === norm(assertion.predicate)
       && norm(a.object) === norm(assertion.object));
-  const own = strings(match?.passages);
+  // A vault note's claim (session log, topic, idea, conversation) lives in the note-claims
+  // sidecar and quotes the note itself (note-claims.ts).
+  const sidecar = !match && assertion.source_node_id
+    ? fileNoteClaims(noteClaimsPath(opts.env ?? process.env, opts.home ?? homedir()))(assertion.source_node_id)?.claims
+      .find(c => norm(c.subject) === norm(assertion.subject) && norm(c.predicate) === norm(assertion.predicate)
+        && norm(c.object) === norm(assertion.object))
+    : undefined;
+  const own = strings(match?.passages ?? sidecar?.passages);
   const notePassages = strings(metadata.passages);
   let passages = own.length ? own : notePassages;
-  const ownScope = metadata.assertion_basis === 'note' ? 'memory_text' as const : 'assertion' as const;
+  const ownScope = metadata.assertion_basis === 'note' || sidecar ? 'memory_text' as const : 'assertion' as const;
   let passagesScope: Provenance['passagesScope'] = own.length ? ownScope : notePassages.length ? 'note' : 'none';
   let support = { verdict: str(metadata.support), check: str(metadata.support_check) };
   let link: Provenance['link'];
