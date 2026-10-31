@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { captureSourceValid } from '../capture-policy.js';
 import { engramProfile } from './verbs.js';
 
 /**
@@ -11,12 +12,39 @@ export function renderEngramAgentProfile(
   generatedAt = new Date().toISOString(),
 ): string {
   const profile = engramProfile(db, { admission: 'promoted_only' });
+  const manifests = new Map<string, unknown>();
+  let incomplete = false;
+  const assertions = [...Object.values(profile.static).flat(), ...profile.dynamic.activeProjects, ...profile.dynamic.recentContext];
+  const ids = new Set(assertions.map(a => a.source_node_id).filter((id): id is string => !!id));
+  if (assertions.some(a => !a.source_node_id)) incomplete = true;
+  for (const contradiction of profile.dynamic.openContradictions) {
+    for (const id of [contradiction.assertion_a, contradiction.assertion_b]) {
+      const assertion = db.prepare('SELECT source_node_id FROM engram_assertions WHERE id=?').get(id) as { source_node_id: string | null } | undefined;
+      if (assertion?.source_node_id) ids.add(assertion.source_node_id); else incomplete = true;
+    }
+  }
+  for (const id of ids) {
+    try {
+      const node = db.prepare('SELECT frontmatter FROM nodes WHERE id=?').get(id) as { frontmatter: string } | undefined;
+      const fm = JSON.parse(node?.frontmatter ?? '{}');
+      const sources = fm.metadata?.capture_sources ?? fm.capture_sources;
+      if (fm.metadata?.capture_incomplete === true || fm.capture_incomplete === true || !Array.isArray(sources) || !sources.length || !sources.every(captureSourceValid)) {
+        incomplete = true;
+        continue;
+      }
+      for (const source of sources) manifests.set(JSON.stringify(source), source);
+    } catch { incomplete = true; }
+  }
+  if (manifests.size > 1024 || Buffer.byteLength(JSON.stringify([...manifests.values()])) > 1024 * 1024) {
+    manifests.clear(); incomplete = true;
+  }
   const lines: string[] = [];
   lines.push('---');
   lines.push('title: "Engram Agent Profile"');
   lines.push('type: agent_profile');
   lines.push(`generated_at: '${generatedAt}'`);
   lines.push('managed: true');
+  lines.push('metadata: ' + JSON.stringify({ capture_sources: [...manifests.values()], capture_incomplete: incomplete }));
   lines.push('---');
   lines.push('');
   lines.push('# Engram Agent Profile');

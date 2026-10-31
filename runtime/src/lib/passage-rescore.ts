@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { Embedder } from './embedder.js';
 import type { SearchResult } from './types.js';
+import type { Store } from './store.js';
+import { memoryReadVersion } from './read-consistency.js';
 
 /**
  * Passage rescoring for the vector arm of memory search.
@@ -65,6 +67,12 @@ function dot(a: Float32Array, b: Float32Array): number {
 }
 
 export interface PassageSource { id: string; title: string; content: string }
+export type ReadCurrent = () => boolean;
+const alwaysCurrent: ReadCurrent = () => true;
+
+function passageHash(n: PassageSource): string {
+  return createHash('sha256').update(n.title).update('\0').update(n.content).digest('hex');
+}
 
 /** Process-local passage vectors, keyed by node id and invalidated by content hash. */
 export class PassageVectors {
@@ -75,9 +83,10 @@ export class PassageVectors {
   get size(): number { return this.cache.size; }
 
   /** Embed and cache passages for nodes that are missing or whose content changed. */
-  async ensure(nodes: PassageSource[]): Promise<void> {
+  async ensure(nodes: PassageSource[], current: ReadCurrent = alwaysCurrent): Promise<boolean> {
     for (const n of nodes) {
-      const hash = createHash('sha256').update(n.title).update('\0').update(n.content).digest('hex');
+      if (!current()) { this.cache.clear(); return false; }
+      const hash = passageHash(n);
       const hit = this.cache.get(n.id);
       if (hit && hit.hash === hash) {
         this.cache.delete(n.id); this.cache.set(n.id, hit); // refresh LRU position
@@ -87,24 +96,31 @@ export class PassageVectors {
       // vectors by up to ~0.01 cosine, which would make results depend on what
       // else a passage happened to be embedded with.
       const vecs: Float32Array[] = [];
-      for (const t of splitPassages(n.title, n.content)) vecs.push(await this.embedder.embed(t));
+      for (const t of splitPassages(n.title, n.content)) {
+        if (!current()) { this.cache.clear(); return false; }
+        const vector = await this.embedder.embed(t);
+        if (!current()) { this.cache.clear(); return false; }
+        vecs.push(vector);
+      }
       this.cache.set(n.id, { hash, vecs });
     }
     while (this.cache.size > this.maxNodes) this.cache.delete(this.cache.keys().next().value!);
+    if (!current()) { this.cache.clear(); return false; }
+    return true;
   }
 
   /** Best passage cosine per node against a normalized query embedding. */
-  async best(query: Float32Array, nodes: PassageSource[]): Promise<Map<string, number>> {
-    await this.ensure(nodes);
+  async best(query: Float32Array, nodes: PassageSource[], current: ReadCurrent = alwaysCurrent): Promise<Map<string, number>> {
+    if (!await this.ensure(nodes, current)) return new Map();
     const out = new Map<string, number>();
     for (const n of nodes) {
       const entry = this.cache.get(n.id);
-      if (!entry || entry.vecs.length === 0) continue;
+      if (!entry || entry.hash !== passageHash(n) || entry.vecs.length === 0) continue;
       let best = -1;
       for (const v of entry.vecs) best = Math.max(best, dot(query, v));
       out.set(n.id, best);
     }
-    return out;
+    return current() ? out : new Map();
   }
 }
 
@@ -137,11 +153,33 @@ export function mergePassageCandidates(
   return [...pool.values()].sort((a, b) => b.cos - a.cos).slice(0, limit).map(e => e.r);
 }
 
-const shared = new WeakMap<object, PassageVectors>();
+const shared = new WeakMap<object, WeakMap<object, PassageVectors>>();
 
-/** One passage cache per embedder, so every caller of memory search shares it. */
-export function passageVectorsFor(embedder: Pick<Embedder, 'embed'>): PassageVectors {
-  let p = shared.get(embedder);
-  if (!p) { p = new PassageVectors(embedder); shared.set(embedder, p); }
+/** Share a model's passage cache within one store; keep other stores isolated. */
+export function passageVectorsFor(embedder: Pick<Embedder, 'embed'>, scope: object = embedder): PassageVectors {
+  let scopes = shared.get(embedder);
+  if (!scopes) { scopes = new WeakMap(); shared.set(embedder, scopes); }
+  let p = scopes.get(scope);
+  if (!p) { p = new PassageVectors(embedder); scopes.set(scope, p); }
   return p;
+}
+
+/** Read one eligible body at a time; stop if the corpus or policy changes. */
+export async function warmMemoryPassages(store: Store, embedder: Pick<Embedder, 'embed'>): Promise<number> {
+  const version = memoryReadVersion(store);
+  const current = () => memoryReadVersion(store) === version;
+  const ids = store.db.prepare(
+    `SELECT id FROM nodes WHERE source = 'vault' AND id LIKE 'Memory/%'`,
+  ).all() as Array<{ id: string }>;
+  const passages = passageVectorsFor(embedder, store);
+  let count = 0;
+  for (const { id } of ids) {
+    if (!current()) break;
+    const node = store.getNode(id);
+    if (!node) continue;
+    if (!await passages.ensure([{ id, title: node.title, content: node.content ?? '' }], current)) break;
+    count++;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  return count;
 }

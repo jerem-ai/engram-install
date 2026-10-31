@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { CONTRADICTION_QUEUE_LIMIT } from './contradiction-slots.js';
 
 /**
  * Data-level health checks for Engram.
@@ -72,6 +73,7 @@ export interface EngramHealthInput {
   historyRefresh?: HistoryRefreshInput | null;
   recallUsage?: { source: string; alarm: string; alarm_day?: string; review_queue_size?: number }[];
   driftReview?: unknown;
+  contradictions?: unknown;
 }
 
 export interface EngramHealthResult {
@@ -98,6 +100,7 @@ export function runEngramHealthChecks(input: EngramHealthInput): EngramHealthRes
     ...(input.historyRefresh ? [historyRefreshCurrent(input.historyRefresh, now)] : []),
     ...(input.recallUsage ?? []).map(recallUsageHealth),
     ...(input.driftReview !== undefined ? [driftReviewHealth(input.driftReview, now)] : []),
+    ...(input.contradictions !== undefined ? [contradictionQueueHealth(input.contradictions, now)] : []),
   ];
   return {
     status: worst(checks.map(c => c.status)),
@@ -269,4 +272,21 @@ export function driftReviewHealth(report: unknown, now: Date): EngramCheck {
   if (marked > DRIFT_MARK_LIMIT) return fail(`${marked} drift marks; limit ${DRIFT_MARK_LIMIT}, promotion is not keeping up`);
   return { id: 'memory_drift_review', status: 'ok', value: marked,
     detail: `${marked} inert drift marks; ${r.watching} first flags; last run ${last!.status}. Marks change no memory.` };
+}
+
+/**
+ * Loop B heartbeat: the nightly scan must have run, and the open queue must stay
+ * under CONTRADICTION_QUEUE_LIMIT so it cannot become an ignored channel.
+ */
+export function contradictionQueueHealth(report: unknown, now: Date): EngramCheck {
+  const fail = (detail: string): EngramCheck => ({ id: 'contradiction_queue', status: 'fail', detail });
+  if (!report || typeof report !== 'object') return fail('contradiction scan state missing or unreadable');
+  const r = report as { schema?: string; last_run?: { status?: string; ended_at?: string; new_cases?: number; capped?: boolean }; open?: number | null };
+  if (r.schema !== 'engram.contradictions.v1') return fail('invalid contradiction scan state');
+  const age = now.getTime() - Date.parse(r.last_run?.ended_at ?? '');
+  if (!Number.isFinite(age) || age < 0 || age > HISTORY_REFRESH_STALE_MS) return fail('contradiction scan is stale or has an invalid clock');
+  if (r.last_run?.status !== 'ok' || !Number.isSafeInteger(r.open) || r.open! < 0) return fail('last contradiction scan failed');
+  if (r.open! > CONTRADICTION_QUEUE_LIMIT) return fail(`${r.open} open contradictions; limit ${CONTRADICTION_QUEUE_LIMIT}`);
+  return { id: 'contradiction_queue', status: 'ok', value: r.open!,
+    detail: `${r.open} open contradictions; last scan added ${r.last_run.new_cases ?? 0}${r.last_run.capped ? ' (capped)' : ''}` };
 }

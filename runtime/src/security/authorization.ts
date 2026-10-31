@@ -58,6 +58,7 @@ export const DEFAULT_TOOL_RULES: Readonly<Record<string, ToolRule>> = Object.fre
   engram_corpus_route: { scope: 'engram:read', risk: 'read' },
   engram_corpus_recall: { scope: 'engram:read', risk: 'read' },
   engram_x1c_recall: { scope: 'engram:read', risk: 'read' },
+  engram_u1_recall: { scope: 'engram:read', risk: 'read' },
   engram_explain: { scope: 'engram:read', risk: 'read' },
   engram_contradiction_queue: { scope: 'engram:read', risk: 'read' },
   engram_profile: { scope: 'engram:read', risk: 'read' },

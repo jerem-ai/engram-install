@@ -291,21 +291,25 @@ export interface AgentProfile {
 
 export function engramProfile(
   db: Database.Database,
-  opts: { admission?: MemoryAdmissionMode } = {},
+  opts: { admission?: MemoryAdmissionMode; profileFilter?: (row: EngramAssertion) => boolean } = {},
 ): AgentProfile {
   const gate = memorySourceGate(db, opts.admission);
   const sourceFilter = opts.admission === 'promoted_only' || opts.admission === 'admitted'
     ? `AND ${admittedSourceSql('engram_assertions.source_node_id', opts.admission)}`
     : '';
-  const admitted = (rows: EngramAssertion[]): EngramAssertion[] =>
-    gate ? rows.filter(row => gate(row.source_node_id)) : rows;
+  const admitted = (rows: EngramAssertion[], limit: number): EngramAssertion[] => rows
+    .filter(row => (!gate || gate(row.source_node_id)) && (!opts.profileFilter || opts.profileFilter(row)))
+    .slice(0, limit);
+  // A scoped profile must select eligible rows before applying category limits.
+  const limit = (count: number): string => opts.profileFilter ? '' : `LIMIT ${count}`;
+  const tie = opts.profileFilter ? ', id' : '';
   // Static profile: durable high-confidence assertions about user preferences, identity, constraints
   const preferences = db.prepare(`
     SELECT * FROM engram_assertions
     WHERE status = 'current' AND confidence >= 0.8
       AND predicate IN ('prefers', 'likes', 'wants', 'chooses', 'uses', 'dislikes', 'avoids', 'rejects')
       ${sourceFilter}
-    ORDER BY confidence DESC LIMIT 20
+    ORDER BY confidence DESC${tie} ${limit(20)}
   `).all() as EngramAssertion[];
 
   const identity = db.prepare(`
@@ -313,7 +317,7 @@ export function engramProfile(
     WHERE status = 'current' AND confidence >= 0.9
       AND predicate IN ('is', 'works_as', 'lives_in', 'owns', 'drives')
       ${sourceFilter}
-    ORDER BY confidence DESC LIMIT 10
+    ORDER BY confidence DESC${tie} ${limit(10)}
   `).all() as EngramAssertion[];
 
   const constraints = db.prepare(`
@@ -321,7 +325,7 @@ export function engramProfile(
     WHERE status = 'current' AND confidence >= 0.7
       AND predicate IN ('requires', 'needs', 'must', 'cannot', 'should', 'should_not')
       ${sourceFilter}
-    ORDER BY confidence DESC LIMIT 15
+    ORDER BY confidence DESC${tie} ${limit(15)}
   `).all() as EngramAssertion[];
 
   const environment = db.prepare(`
@@ -330,7 +334,7 @@ export function engramProfile(
       AND (subject = 'Mac Mini' OR subject = 'UM790' OR subject = 'system'
            OR predicate IN ('runs_on', 'deployed_to', 'hosts', 'uses_infra'))
       ${sourceFilter}
-    ORDER BY confidence DESC LIMIT 10
+    ORDER BY confidence DESC${tie} ${limit(10)}
   `).all() as EngramAssertion[];
 
   // Dynamic profile: recent assertions about active projects / context
@@ -340,14 +344,14 @@ export function engramProfile(
       AND (predicate = 'project' OR predicate = 'working_on' OR predicate = 'developing'
            OR subject IN ('Engram', 'Hermes', 'Maestro', 'Alfred', 'PrintOS'))
       ${sourceFilter}
-    ORDER BY created_at DESC LIMIT 15
+    ORDER BY created_at DESC${tie} ${limit(15)}
   `).all() as EngramAssertion[];
 
   const recentContext = db.prepare(`
     SELECT * FROM engram_assertions
     WHERE status = 'current' AND created_at > datetime('now', '-7 days')
       ${sourceFilter}
-    ORDER BY created_at DESC LIMIT 20
+    ORDER BY created_at DESC${tie} ${limit(20)}
   `).all() as EngramAssertion[];
 
   const openCtr = db.prepare(`
@@ -370,14 +374,14 @@ export function engramProfile(
     authority: MEMORY_AUTHORITY,
     generatedAt: new Date().toISOString(),
     static: {
-      preferences: admitted(preferences),
-      identity: admitted(identity),
-      constraints: admitted(constraints),
-      environment: admitted(environment),
+      preferences: admitted(preferences, 20),
+      identity: admitted(identity, 10),
+      constraints: admitted(constraints, 15),
+      environment: admitted(environment, 10),
     },
     dynamic: {
-      activeProjects: admitted(activeProjects),
-      recentContext: admitted(recentContext),
+      activeProjects: admitted(activeProjects, 15),
+      recentContext: admitted(recentContext, 20),
       openContradictions: admittedContradictions.map(c => ({
       id: c.id,
       subject: c.subject,

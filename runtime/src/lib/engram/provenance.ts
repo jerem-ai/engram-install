@@ -4,6 +4,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readEngramEnv } from '../install-config.js';
 import { fileNoteClaims, noteClaimsPath } from './note-claims.js';
+import { captureDecision, capturePathAllowed, readCapturePolicy } from '../capture-policy.js';
+import { findSelectedTranscript, type SelectedTranscript } from './selected-transcript.js';
+import { sourceTurns, type SourceTurns } from './source-turns.js';
 
 /**
  * The provenance block engram_explain returns: which session a fact came from, the
@@ -23,7 +26,7 @@ export interface TranscriptLocation {
   /** Absolute path on this machine (status `local`). */
   path?: string;
   /** Archive copy (status `archive`): host and root of the archive, path under it, storage form. */
-  archive?: { host: string; root: string; logicalPath: string; storage: string };
+  archive?: { host: string; root: string; logicalPath: string; storage: string } | SelectedTranscript;
   /** Why the log could not be found (status `log_missing`). */
   reason?: string;
   /** When the archive index was written; absent when no index exists. */
@@ -44,6 +47,7 @@ export interface Provenance {
   passagesScope: 'assertion' | 'memory_text' | 'note' | 'link' | 'none';
   support: { verdict: string | null; check: string | null };
   transcript: TranscriptLocation;
+  sourceTurns?: SourceTurns;
   /** The nightly linker's result for an engram_remember fact (extraction/link_facts.py). */
   link?: { support: string; summaryOnly: boolean; linkedAt: string | null; judge: string | null };
 }
@@ -81,6 +85,8 @@ export function factLinkKey(sourceNodeId: string, a: AssertionTriple): string {
  * used when no record carries the exact key.
  */
 export function findFactLink(path: string, key: string, a?: AssertionTriple): Json | null {
+  const policy = readCapturePolicy();
+  if (!captureDecision(policy, null).allowed || !capturePathAllowed(policy, path)) return null;
   if (!existsSync(path)) return null;
   const n = (v: unknown) => String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
   let exact: Json | null = null;
@@ -137,6 +143,7 @@ function isFile(path: string): boolean {
 
 /** Live transcript on this machine, if the host has not expired it yet. */
 export function findLocalTranscript(key: string, env: NodeJS.ProcessEnv = process.env, home = homedir()): string | null {
+  if (!captureDecision(readCapturePolicy(), null).allowed) return null;
   const rollout = /^rollout-(\d{4})-(\d{2})-(\d{2})T/.exec(key);
   if (rollout) {
     const codexHome = env.CODEX_HOME ?? join(home, '.codex');
@@ -181,6 +188,8 @@ interface IndexHit { host: string; root: string; logicalPath: string; storage: s
  * Rows: archive_key, storage_kind, stored_bytes, mtime_epoch, logical_path.
  */
 export function findArchivedTranscript(key: string, indexPath: string): { hit: IndexHit | null; generatedAt?: string; exists: boolean; missing?: string } {
+  const policy = readCapturePolicy();
+  if (!captureDecision(policy, null).allowed || !capturePathAllowed(policy, indexPath)) return { hit: null, exists: false };
   if (!existsSync(indexPath)) return { hit: null, exists: false };
   const text = readFileSync(indexPath, 'utf8');
   const header = /^# engram\.transcript-index\.v1 dest=([^:\s]+):(\S+) generated=(\S+)/m.exec(text);
@@ -222,9 +231,22 @@ export function findArchivedTranscript(key: string, indexPath: string): { hit: I
   return { hit: best, generatedAt, exists: true, ...(missing && !best ? { missing } : {}) };
 }
 
-export function locateTranscript(key: string | null, keyReason: string | undefined, opts: ProvenanceOptions = {}): TranscriptLocation {
+export function locateTranscript(key: string | null, keyReason: string | undefined, opts: ProvenanceOptions = {},
+  binding?: { session: string | null; sources: unknown }): TranscriptLocation {
   const env = opts.env ?? process.env;
   const home = opts.home ?? homedir();
+  if (binding?.sources !== undefined) {
+    const configured = env.ENGRAM_ARCHIVE_DIR ?? readEngramEnv(home).ENGRAM_ARCHIVE_DIR;
+    const roots = [join(home, '.local/share/engram/archive-pending')];
+    if (configured && configured !== 'off') roots.unshift(configured);
+    const archive = findSelectedTranscript(binding.session, binding.sources, roots);
+    if (archive) return { status: 'archive', archive };
+    // With no capture policy (every default install) nothing is excluded, so a bound
+    // memory with no exact-revision copy (a session outside a Git repository never gets
+    // one) uses the unbound lookup below. A configured policy keeps the exact-revision rule.
+    if (readCapturePolicy().state !== 'legacy') return { status: 'log_missing', reason: 'bound_archive_unavailable' };
+  }
+  if (!captureDecision(readCapturePolicy(), null).allowed) return { status: 'log_missing', reason: 'capture_policy_deferred' };
   if (!key) return { status: 'log_missing', reason: keyReason ?? 'no transcript id' };
   const local = findLocalTranscript(key, env, home);
   if (local) return { status: 'local', path: local };
@@ -298,10 +320,14 @@ export function buildProvenance(frontmatter: Json, assertion: AssertionTriple, o
   }
 
   const { key, reason } = sessionKeyOf(session);
-  let transcript = locateTranscript(key, reason, opts);
+  let transcript = locateTranscript(key, reason, opts, {
+    session, sources: metadata.capture_sources ?? frontmatter.capture_sources,
+  });
   if (opts.detail === 'redacted') {
     transcript = { status: transcript.status, ...(transcript.status === 'log_missing' ? { reason: 'original log not found' } : {}) };
   }
+  const turns = opts.detail !== 'redacted' && (passagesScope === 'assertion' || passagesScope === 'note')
+    ? sourceTurns(metadata.source_turns, passages, metadata.capture_sources ?? frontmatter.capture_sources) : undefined;
   return {
     sourceSession: session,
     sessionKey: key,
@@ -310,6 +336,7 @@ export function buildProvenance(frontmatter: Json, assertion: AssertionTriple, o
     passagesScope,
     support,
     transcript,
+    ...(turns ? { sourceTurns: turns } : {}),
     ...(link ? { link } : {}),
   };
 }

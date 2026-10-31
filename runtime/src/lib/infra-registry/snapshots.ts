@@ -1,5 +1,7 @@
+import { captureArtifactAllowed, capturePathAllowed, readCapturePolicy } from '../capture-policy.js';
+import { parseFrontmatterLoud } from '../parser.js';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { InfraRegistryStore } from './store.js';
@@ -16,6 +18,10 @@ export interface SnapshotSource {
   sha256?: string;
   content?: string;
   error?: string;
+  bytes?: number;
+  truncated?: boolean;
+  source_sha256?: string;
+  duplicate_of?: string;
 }
 
 export interface GlobalBootstrapSnapshot {
@@ -114,10 +120,29 @@ export function buildGlobalSnapshot(
   };
 }
 
-function readSnapshotSource(id: string, path: string): SnapshotSource {
+export function readSnapshotSource(id: string, path: string, maxBytes = MAX_GUIDANCE_BYTES): SnapshotSource {
+  let fd: number | undefined;
   try {
-    const stat = statSync(path);
-    const content = redact(readFileSync(path, 'utf-8').slice(0, MAX_GUIDANCE_BYTES));
+    const policy = readCapturePolicy();
+    if (!capturePathAllowed(policy, path)) return { id, path, status: 'error', error: 'capture policy withheld context' };
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('Context source exceeds the bounded text-source size');
+    const buffer = Buffer.alloc(stat.size + 1); let length = 0;
+    while (length < buffer.length) {
+      const count = readSync(fd, buffer, length, buffer.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+    const after = fstatSync(fd);
+    if (length !== stat.size || stat.size !== after.size || stat.mtimeMs !== after.mtimeMs
+      || !capturePathAllowed(readCapturePolicy(), path)) throw new Error('Context source changed or was withheld during read');
+    const raw = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, length));
+    const preview = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, Math.min(length, maxBytes)), { stream: length > maxBytes });
+    const content = redact(preview);
+    if (id === 'engram-agent-profile' && !captureArtifactAllowed(readCapturePolicy(), parseFrontmatterLoud(content, path).fm)) {
+      return { id, path, status: 'error', error: 'capture policy withheld agent profile' };
+    }
     return {
       id,
       path,
@@ -125,6 +150,9 @@ function readSnapshotSource(id: string, path: string): SnapshotSource {
       modified_at: stat.mtime.toISOString(),
       sha256: createHash('sha256').update(content).digest('hex'),
       content,
+      bytes: Buffer.byteLength(raw),
+      truncated: length > maxBytes,
+      source_sha256: createHash('sha256').update(raw).digest('hex'),
     };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
@@ -134,7 +162,7 @@ function readSnapshotSource(id: string, path: string): SnapshotSource {
       status: code === 'ENOENT' ? 'missing' : 'error',
       error: err instanceof Error ? err.message : String(err),
     };
-  }
+  } finally { if (fd !== undefined) closeSync(fd); }
 }
 
 function renderRegistryMarkdown(registry: {

@@ -14,6 +14,7 @@ import { SessionRegistry } from './session-registry.js';
 import { LOCAL_MEMORY_ADMISSION } from './local-admission.js';
 import type { MemorySearchOpts } from '../lib/memory-search.js';
 import type { SearchResult } from '../lib/types.js';
+import type { PerformanceReport } from '../lib/performance-trace.js';
 
 export interface SessionLimits {
   ttlMs: number;
@@ -36,6 +37,8 @@ export interface KgHttpAppOptions {
   sse: SessionLimits;
   /** When omitted, GET /memory/search answers 503. */
   memorySearch?: MemorySearchFn;
+  /** Operator opt-in. Emits body-free Server-Timing metrics; off by default. */
+  memoryPerformance?: boolean;
 }
 
 export const MEMORY_SEARCH_DEFAULT_LIMIT = 10;
@@ -197,11 +200,23 @@ export function createKgHttpApp(options: KgHttpAppOptions): KgHttpApp {
       model: queryString(req.query.model) || undefined,
       admission: LOCAL_MEMORY_ADMISSION,
     };
+    let performanceReport: PerformanceReport | undefined;
+    if (options.memoryPerformance) searchOpts.performance = report => { performanceReport = report; };
     try {
       const results = await options.memorySearch(q, searchOpts);
       const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
       res.setHeader('X-KG-Search-Ms', elapsedMs.toFixed(1));
-      res.json(results);
+      if (performanceReport) {
+        const encodeStart = performance.now();
+        const body = JSON.stringify(results);
+        const serializationMs = performance.now() - encodeStart;
+        const metrics = performanceReport.spans.map((span, i) =>
+          `engram_${span.stage}_${i};dur=${span.duration_ms.toFixed(3)}`);
+        metrics.push(`engram_search;dur=${performanceReport.total_ms.toFixed(3)}`,
+          `engram_serialization;dur=${serializationMs.toFixed(3)}`);
+        res.setHeader('Server-Timing', metrics.join(', '));
+        res.type('application/json').send(body);
+      } else res.json(results);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[kg-http] /memory/search failed: ${message}`);

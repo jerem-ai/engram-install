@@ -1,6 +1,7 @@
 import { readdir, readFile } from 'fs/promises';
 import { join, basename, normalize as normalizePath } from 'path';
 import matter from 'gray-matter';
+import { readFileSnapshot, SourceFileChangedError, type FileReadRevision } from './file-snapshot.js';
 import {
   extractWikiLinks,
   buildStemLookup,
@@ -80,10 +81,12 @@ export interface ParseResult {
   edges: ParsedEdge[];
   stubIds: Set<string>;
   skippedPaths: string[];
+  sourceRevisions: Map<string, FileReadRevision>;
 }
 
 export interface ParseVaultOptions {
   includeFile?: (relativePath: string) => boolean;
+  includeFrontmatter?: (frontmatter: Record<string, unknown>, relativePath: string) => boolean;
   suppressUnresolvedLink?: (linkTarget: string) => boolean;
   /**
    * Drop generated link blocks (topic-linker footers, kg-enrich `## Related`
@@ -99,6 +102,15 @@ const MANAGED_BLOCK = /<!-- (topic-linker|kg-related):start -->[\s\S]*?(?:<!-- \
 export function stripManagedBlocks(content: string): string {
   const stripped = content.replace(MANAGED_BLOCK, '');
   return stripped === content ? content : stripped.replace(/\s+$/, '\n');
+}
+
+/** The normal node projection, also used for frozen extraction-effect intents. */
+export function parsedVaultNode(parsed: FrontmatterParse, id: string, stripManaged = false): ParsedNode {
+  const content = stripManaged ? stripManagedBlocks(parsed.content) : parsed.content;
+  const inlineTags = extractInlineTags(content);
+  const frontmatter = { ...parsed.fm };
+  if (inlineTags.length > 0) frontmatter.inline_tags = inlineTags;
+  return { id, title: (parsed.fm.title as string) ?? basename(id, '.md'), content, frontmatter };
 }
 
 interface FrontmatterRelation {
@@ -191,29 +203,34 @@ export async function parseVault(
   const stemLookup = buildStemLookup(discoveredPaths);
   const allPathsSet = new Set(discoveredPaths);
   const nodes: ParsedNode[] = [];
+  const sourceRevisions = new Map<string, FileReadRevision>();
   const edges: ParsedEdge[] = [];
   const stubIds = new Set<string>();
   const strip = options.stripManagedBlocks ?? process.env.KG_STRIP_MANAGED_BLOCKS === '1';
 
   for (const relPath of mdPaths) {
     const absPath = join(vaultPath, relPath);
-    const raw = await readFile(absPath, 'utf-8');
+    let snapshot: Awaited<ReturnType<typeof readFileSnapshot>>;
+    try { snapshot = await readFileSnapshot(absPath); }
+    catch (error) {
+      if (error instanceof SourceFileChangedError || (error as NodeJS.ErrnoException).code === 'ENOENT') {
+        skippedPaths.push(relPath); continue;
+      }
+      throw error;
+    }
+    const raw = snapshot.raw;
 
     const parsed = parseFrontmatterLoud(raw, relPath);
     const { fm, warning } = parsed;
-    const content = strip ? stripManagedBlocks(parsed.content) : parsed.content;
-    if (warning) console.warn(`WARN: ${warning}`);
-
-    const title = (fm.title as string)
-      ?? basename(relPath, '.md');
-
-    const inlineTags = extractInlineTags(content);
-    const frontmatter = { ...fm };
-    if (inlineTags.length > 0) {
-      frontmatter.inline_tags = inlineTags;
+    if (options.includeFrontmatter && !options.includeFrontmatter(fm, relPath)) {
+      skippedPaths.push(relPath);
+      continue;
     }
-
-    nodes.push({ id: relPath, title, content, frontmatter });
+    const node = parsedVaultNode(parsed, relPath, strip);
+    if (warning) console.warn(`WARN: ${warning}`);
+    const { content } = node;
+    nodes.push(node);
+    sourceRevisions.set(relPath, snapshot.revision);
 
     // Frontmatter relations array: explicit typed links with optional confidence/since
     const fmRelations = parseFrontmatterRelations(fm, corpusRelationTypes);
@@ -279,7 +296,7 @@ export async function parseVault(
     }
   }
 
-  return { nodes, edges, stubIds, skippedPaths };
+  return { nodes, edges, stubIds, skippedPaths, sourceRevisions };
 }
 
 function parseFrontmatterRelations(fm: Record<string, unknown>, extra?: ReadonlySet<string>): FrontmatterRelation[] {

@@ -1,10 +1,13 @@
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, readSync,
+  closeSync, constants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readFileSync, readSync,
   readdirSync, statSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { captureDecision, capturePathAllowed, readCapturePolicy, type CaptureSource } from '../capture-policy.js';
+import { HistoryCaptureBlocked, HistoryCaptureCollector, installHistoryCaptureViews, openHistoryReadDb,
+  preflightHistorySource, readHistoryBinding, requireHistoryBindingsAllowed, requireUnboundHistoryAllowed, writeHistoryBinding } from './capture-policy.js';
 
 // Contract: transcript-history staging and search
 // - Stages allowlisted Codex and Claude user-visible messages into an isolated SQLite database.
@@ -52,6 +55,7 @@ export interface StageResult {
   captureRevisions: number;
   unchangedSources: number;
   skippedSources: number;
+  policyDeferredSources?: number;
   errorCount: number;
   lastCommittedSource: string | null;
   metrics: {
@@ -171,7 +175,13 @@ const CLAUDE_METADATA_TYPES = new Set([
   'queue-operation', 'attachment', 'atis-latch', 'ai-title', 'bridge-session', 'custom-title',
   'agent-name', 'artifact-autoreact-ledger', 'artifact-comment-monitor',
   'cost-state', 'file-history-delta', 'file-history-snapshot', 'frame-link',
+  // Isolation state and tool-name inventories are control metadata; visible
+  // messages have their own rows. Do not project these records into history.
+  'isolation-latch', 'tools-used',
   'last-prompt', 'mode', 'permission-mode', 'pr-link', 'system',
+  // Request log rows from Claude Code 2.1.300 (October 16): the request shape, its
+  // parameters and its body. The conversation they record is in user/assistant rows.
+  'api-request', 'api-request-shape', 'api-request-blob',
 ]);
 const CLAUDE_IGNORED_BLOCKS = new Set([
   'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'image', 'document',
@@ -288,6 +298,10 @@ export function inventoryHistorySources(input: HistoryInventoryInput): HistoryIn
     };
   }
 
+  if (!captureDecision(readCapturePolicy(), null).allowed) {
+    for (const category of Object.values(categories)) delete category.detail;
+    reconciliation.length = 0;
+  }
   return {
     sources: [...localCodex.sources, ...localClaude.sources, ...archiveSources],
     reconciliation,
@@ -302,6 +316,7 @@ export function writeHistoryRunArtifacts(
   result: StageResult,
   limits: HistoryLimits,
 ): { capacityPath: string; runManifestPath: string } {
+  requireUnboundHistoryAllowed([outputDir]);
   mkdirSync(outputDir, { recursive: true });
   const capacityPath = join(outputDir, 'capacity.json');
   const runManifestPath = join(outputDir, 'run-manifest.json');
@@ -373,6 +388,14 @@ export function writeHistoryRunArtifacts(
 
 export function stageTranscriptSources(options: StageOptions): StageResult {
   validateLimits(options.limits);
+  if (!capturePathAllowed(readCapturePolicy(), options.dbPath)) {
+    return { status: 'completed', stopReason: null, insertedTranscripts: 0, insertedEvents: 0, captureRevisions: 0,
+      unchangedSources: 0, skippedSources: options.sources.length, policyDeferredSources: options.sources.length,
+      errorCount: 0, lastCommittedSource: null,
+      metrics: { durationMs: 0, inputBytes: 0, outputBytes: 0, cpuUserMicros: 0, cpuSystemMicros: 0,
+        peakRssBytes: 0, peakSourceBufferBytes: 0, maxRecordBytes: 0, tempDiskBytes: 0, indexReadLatencyMs: 0,
+        sourceCount: 0 } };
+  }
   const db = openHistoryDb(options.dbPath);
   const started = Date.now();
   const cpuStarted = process.cpuUsage();
@@ -382,6 +405,7 @@ export function stageTranscriptSources(options: StageOptions): StageResult {
   let captureRevisions = 0;
   let unchangedSources = 0;
   let skippedSources = 0;
+  let policyDeferredSources = 0;
   let errorCount = 0;
   let lastCommittedSource: string | null = null;
   let status: StageResult['status'] = 'completed';
@@ -406,187 +430,210 @@ export function stageTranscriptSources(options: StageOptions): StageResult {
         stopReason = 'max_runtime_ms';
         break;
       }
-      if (!existsSync(source.path)) {
-        ({ status, stopReason, errorCount } = recordStageError(
-          db, source, 'missing_source', errorCount, options.limits.maxErrors,
-        ));
-        changed = true;
-        if (status === 'stopped') break;
-        continue;
-      }
-      const sourceBytes = safeSize(source.path);
-      if (sourceBytes > options.limits.maxSourceBytes) {
-        recordStageSkip(db, source, 'excluded_max_source_bytes');
-        skippedSources += 1;
-        changed = true;
-        continue;
-      }
-      if (inputBytes + sourceBytes > options.limits.maxInputBytes) {
-        status = 'stopped';
-        stopReason = 'max_input_bytes';
-        break;
-      }
-      inputBytes += sourceBytes;
-      const sourceRead = tryParseSource(source, sourceBytes, options.limits.maxPayloadBytes);
-      peakSourceBufferBytes = Math.max(peakSourceBufferBytes, sourceRead.peakBufferBytes);
-      maxRecordBytes = Math.max(maxRecordBytes, sourceRead.maxRecordBytes);
-      if ('error' in sourceRead) {
-        ({ status, stopReason, errorCount } = recordStageError(
-          db, source, sourceRead.error, errorCount, options.limits.maxErrors,
-        ));
-        changed = true;
-        if (status === 'stopped') break;
-        continue;
-      }
-      const { hash, parsed } = sourceRead;
+      try {
+        preflightHistorySource(source, options.dbPath);
+        if (!existsSync(source.path)) {
+          ({ status, stopReason, errorCount } = recordStageError(
+            db, source, 'missing_source', errorCount, options.limits.maxErrors,
+          ));
+          changed = true;
+          if (status === 'stopped') break;
+          continue;
+        }
+        const sourceBytes = safeSize(source.path);
+        if (sourceBytes > options.limits.maxSourceBytes) {
+          recordStageSkip(db, source, 'excluded_max_source_bytes');
+          skippedSources += 1;
+          changed = true;
+          continue;
+        }
+        if (inputBytes + sourceBytes > options.limits.maxInputBytes) {
+          status = 'stopped';
+          stopReason = 'max_input_bytes';
+          break;
+        }
+        inputBytes += sourceBytes;
+        const sourceRead = tryParseSource(source, sourceBytes, options.limits.maxPayloadBytes, options.dbPath);
+        peakSourceBufferBytes = Math.max(peakSourceBufferBytes, sourceRead.peakBufferBytes);
+        maxRecordBytes = Math.max(maxRecordBytes, sourceRead.maxRecordBytes);
+        if ('error' in sourceRead) {
+          ({ status, stopReason, errorCount } = recordStageError(
+            db, source, sourceRead.error, errorCount, options.limits.maxErrors,
+          ));
+          changed = true;
+          if (status === 'stopped') break;
+          continue;
+        }
+        const { hash, parsed, captureSources } = sourceRead;
+        const requireAllowed = () => {
+          preflightHistorySource(source, options.dbPath);
+          requireHistoryBindingsAllowed(captureSources);
+          const previousBinding = readHistoryBinding(db, parsed.transcriptId);
+          if (previousBinding) requireHistoryBindingsAllowed(captureSources, previousBinding);
+        };
+        requireAllowed();
 
-      const previous = db.prepare(`
-        SELECT source_hash, size_bytes, source_path
-        FROM history_captures
-        WHERE transcript_id = ? AND status = 'accepted'
-        ORDER BY capture_revision DESC LIMIT 1
-      `).get(parsed.transcriptId) as {
-        source_hash: string; size_bytes: number; source_path: string;
-      } | undefined;
+        const previous = db.prepare(`
+          SELECT source_hash, size_bytes, source_path
+          FROM history_captures
+          WHERE transcript_id = ? AND status = 'accepted'
+          ORDER BY capture_revision DESC LIMIT 1
+        `).get(parsed.transcriptId) as {
+          source_hash: string; size_bytes: number; source_path: string;
+        } | undefined;
 
-      if (previous?.source_hash === hash) {
-        if (previous.source_path !== sourceReceipt || source.receiptInventoryFingerprint !== undefined) {
-          const joined = conductorJoin(options.conductorDbPath, parsed.providerSessionId, source.provider);
+        if (previous?.source_hash === hash) {
+          if (previous.source_path !== sourceReceipt || source.receiptInventoryFingerprint !== undefined) {
+            const joined = conductorJoin(options.conductorDbPath, parsed.providerSessionId, source.provider);
+            db.transaction(() => {
+              requireAllowed();
+              writeHistoryBinding(db, parsed.transcriptId, captureSources, true);
+              insertCapture(
+                db, parsed.transcriptId, sourceReceipt, hash, sourceBytes,
+                'duplicate', 'accepted', source.path, source.receiptMtimeMs, source.receiptInventoryFingerprint,
+              );
+              // A duplicate receipt is finished, so it must not keep a seeded pending label.
+              upsertSourceLedger(
+                db, sourceReceipt, source, parsed.providerSessionId,
+                joined.matched, joined.matched ? null : joined.reason,
+              );
+              bumpRevision(db);
+              requireAllowed();
+            })();
+            peakTempDiskBytes = Math.max(peakTempDiskBytes, auxiliaryDatabaseBytes(options.dbPath));
+            captureRevisions += 1;
+            changed = true;
+            lastCommittedSource = sourceReceipt;
+            if (previous.source_path === sourceReceipt) unchangedSources += 1;
+          } else {
+            requireAllowed();
+            unchangedSources += 1;
+          }
+          continue;
+        }
+
+        let captureKind: 'initial' | 'append' | 'rewrite' | 'truncation' = 'initial';
+        if (previous) {
+          if (sourceBytes < previous.size_bytes) {
+            captureKind = 'truncation';
+          } else {
+            const prefixHash = hashFilePrefix(source.path, previous.size_bytes);
+            captureKind = prefixHash === previous.source_hash ? 'append' : 'rewrite';
+          }
+        }
+        let blockKind: 'rewrite' | 'truncation' | 'conflicting_event_id' | null = (
+          captureKind === 'rewrite' || captureKind === 'truncation'
+        ) ? captureKind : null;
+        const newEvents: ParsedEvent[] = [];
+        if (!blockKind) {
+          // A stored event whose content differs from the source's copy is a conflict, like a
+          // repeated ID inside the source: the first accepted copy stays, the capture is blocked.
+          const stored = db.prepare(`
+            SELECT actor, timestamp, content_class, normalized_text FROM history_events WHERE event_id = ?
+          `);
+          let conflicting = parsed.conflictingEventIds > 0;
+          for (const event of parsed.events) {
+            const row = stored.get(event.eventId) as StoredEventContent | undefined;
+            if (!row) newEvents.push(event);
+            else if (!sameStoredContent(row, event)) conflicting = true;
+          }
+          if (conflicting) blockKind = 'conflicting_event_id';
+        }
+        if (blockKind) {
+          const kind = blockKind;
           db.transaction(() => {
+            requireAllowed();
             insertCapture(
               db, parsed.transcriptId, sourceReceipt, hash, sourceBytes,
-              'duplicate', 'accepted', source.path, source.receiptMtimeMs, source.receiptInventoryFingerprint,
+              kind, 'blocked', source.path, source.receiptMtimeMs, source.receiptInventoryFingerprint,
             );
-            // A duplicate receipt is finished, so it must not keep a seeded pending label.
             upsertSourceLedger(
               db, sourceReceipt, source, parsed.providerSessionId,
-              joined.matched, joined.matched ? null : joined.reason,
+              false, `blocked_${kind}`,
             );
             bumpRevision(db);
+            requireAllowed();
           })();
           peakTempDiskBytes = Math.max(peakTempDiskBytes, auxiliaryDatabaseBytes(options.dbPath));
           captureRevisions += 1;
           changed = true;
-          lastCommittedSource = sourceReceipt;
-          if (previous.source_path === sourceReceipt) unchangedSources += 1;
-        } else {
-          unchangedSources += 1;
+          status = 'stopped';
+          stopReason = kind;
+          break;
         }
-        continue;
-      }
 
-      let captureKind: 'initial' | 'append' | 'rewrite' | 'truncation' = 'initial';
-      if (previous) {
-        if (sourceBytes < previous.size_bytes) {
-          captureKind = 'truncation';
-        } else {
-          const prefixHash = hashFilePrefix(source.path, previous.size_bytes);
-          captureKind = prefixHash === previous.source_hash ? 'append' : 'rewrite';
+        const transcriptExists = !!db.prepare(
+          'SELECT 1 FROM history_transcripts WHERE transcript_id = ?',
+        ).get(parsed.transcriptId);
+        const rowCost = (transcriptExists ? 0 : 1) + newEvents.length;
+        const currentRows = countLogicalRows(db);
+        if (currentRows + rowCost > options.limits.maxRows) {
+          status = 'stopped';
+          stopReason = 'max_rows';
+          break;
         }
-      }
-      let blockKind: 'rewrite' | 'truncation' | 'conflicting_event_id' | null = (
-        captureKind === 'rewrite' || captureKind === 'truncation'
-      ) ? captureKind : null;
-      const newEvents: ParsedEvent[] = [];
-      if (!blockKind) {
-        // A stored event whose content differs from the source's copy is a conflict, like a
-        // repeated ID inside the source: the first accepted copy stays, the capture is blocked.
-        const stored = db.prepare(`
-          SELECT actor, timestamp, content_class, normalized_text FROM history_events WHERE event_id = ?
-        `);
-        let conflicting = parsed.conflictingEventIds > 0;
-        for (const event of parsed.events) {
-          const row = stored.get(event.eventId) as StoredEventContent | undefined;
-          if (!row) newEvents.push(event);
-          else if (!sameStoredContent(row, event)) conflicting = true;
-        }
-        if (conflicting) blockKind = 'conflicting_event_id';
-      }
-      if (blockKind) {
-        const kind = blockKind;
-        db.transaction(() => {
+
+        const joined = conductorJoin(options.conductorDbPath, parsed.providerSessionId, source.provider);
+        const project = joined.project ?? source.project ?? parsed.project;
+        const transaction = db.transaction(() => {
+          requireAllowed();
+          writeHistoryBinding(db, parsed.transcriptId, captureSources, transcriptExists);
+          if (!transcriptExists) {
+            db.prepare(`
+              INSERT INTO history_transcripts (
+                transcript_id, provider, runtime, provider_session_id,
+                parent_transcript_id, branch_id, project, started_at, ended_at,
+                source_kind, inclusion_decision, created_at
+              ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'included', ?)
+            `).run(
+              parsed.transcriptId, source.provider, source.runtime, parsed.providerSessionId,
+              parsed.parentTranscriptId, project, parsed.startedAt, parsed.endedAt,
+              source.sourceKind ?? 'local', new Date().toISOString(),
+            );
+          } else if (project) {
+            db.prepare('UPDATE history_transcripts SET project = COALESCE(project, ?) WHERE transcript_id = ?')
+              .run(project, parsed.transcriptId);
+          }
+          for (const event of newEvents) insertEvent(db, parsed.transcriptId, event);
           insertCapture(
             db, parsed.transcriptId, sourceReceipt, hash, sourceBytes,
-            kind, 'blocked', source.path, source.receiptMtimeMs, source.receiptInventoryFingerprint,
+            captureKind, 'accepted', source.path, source.receiptMtimeMs, source.receiptInventoryFingerprint,
           );
           upsertSourceLedger(
             db, sourceReceipt, source, parsed.providerSessionId,
-            false, `blocked_${kind}`,
+            joined.matched, joined.matched ? null : joined.reason,
           );
           bumpRevision(db);
-        })();
-        peakTempDiskBytes = Math.max(peakTempDiskBytes, auxiliaryDatabaseBytes(options.dbPath));
+          peakTempDiskBytes = Math.max(peakTempDiskBytes, auxiliaryDatabaseBytes(options.dbPath));
+          const outputBytes = databaseBytes(db) + peakTempDiskBytes;
+          if (outputBytes > options.limits.maxOutputBytes) throw new CeilingError('max_output_bytes');
+          requireAllowed();
+        });
+
+        try {
+          transaction();
+        } catch (error) {
+          if (error instanceof CeilingError) {
+            status = 'stopped';
+            stopReason = error.message;
+            break;
+          }
+          throw error;
+        }
+        insertedTranscripts += transcriptExists ? 0 : 1;
+        insertedEvents += newEvents.length;
         captureRevisions += 1;
         changed = true;
-        status = 'stopped';
-        stopReason = kind;
-        break;
-      }
-
-      const transcriptExists = !!db.prepare(
-        'SELECT 1 FROM history_transcripts WHERE transcript_id = ?',
-      ).get(parsed.transcriptId);
-      const rowCost = (transcriptExists ? 0 : 1) + newEvents.length;
-      const currentRows = countLogicalRows(db);
-      if (currentRows + rowCost > options.limits.maxRows) {
-        status = 'stopped';
-        stopReason = 'max_rows';
-        break;
-      }
-
-      const joined = conductorJoin(options.conductorDbPath, parsed.providerSessionId, source.provider);
-      const project = joined.project ?? source.project ?? parsed.project;
-      const transaction = db.transaction(() => {
-        if (!transcriptExists) {
-          db.prepare(`
-            INSERT INTO history_transcripts (
-              transcript_id, provider, runtime, provider_session_id,
-              parent_transcript_id, branch_id, project, started_at, ended_at,
-              source_kind, inclusion_decision, created_at
-            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'included', ?)
-          `).run(
-            parsed.transcriptId, source.provider, source.runtime, parsed.providerSessionId,
-            parsed.parentTranscriptId, project, parsed.startedAt, parsed.endedAt,
-            source.sourceKind ?? 'local', new Date().toISOString(),
-          );
-        } else if (project) {
-          db.prepare('UPDATE history_transcripts SET project = COALESCE(project, ?) WHERE transcript_id = ?')
-            .run(project, parsed.transcriptId);
-        }
-        for (const event of newEvents) insertEvent(db, parsed.transcriptId, event);
-        insertCapture(
-          db, parsed.transcriptId, sourceReceipt, hash, sourceBytes,
-          captureKind, 'accepted', source.path, source.receiptMtimeMs, source.receiptInventoryFingerprint,
-        );
-        upsertSourceLedger(
-          db, sourceReceipt, source, parsed.providerSessionId,
-          joined.matched, joined.matched ? null : joined.reason,
-        );
-        bumpRevision(db);
+        lastCommittedSource = sourceReceipt;
         peakTempDiskBytes = Math.max(peakTempDiskBytes, auxiliaryDatabaseBytes(options.dbPath));
-        const outputBytes = databaseBytes(db) + peakTempDiskBytes;
-        if (outputBytes > options.limits.maxOutputBytes) throw new CeilingError('max_output_bytes');
-      });
-
-      try {
-        transaction();
       } catch (error) {
-        if (error instanceof CeilingError) {
-          status = 'stopped';
-          stopReason = error.message;
-          break;
-        }
-        throw error;
+        if (!(error instanceof HistoryCaptureBlocked)) throw error;
+        skippedSources += 1;
+        policyDeferredSources += 1;
       }
-      insertedTranscripts += transcriptExists ? 0 : 1;
-      insertedEvents += newEvents.length;
-      captureRevisions += 1;
-      changed = true;
-      lastCommittedSource = sourceReceipt;
-      peakTempDiskBytes = Math.max(peakTempDiskBytes, auxiliaryDatabaseBytes(options.dbPath));
     }
 
-    if (changed) {
+    if (changed && captureDecision(readCapturePolicy(), null).allowed) {
       db.prepare(`
         INSERT INTO history_runs (
           run_id, status, stop_reason, input_bytes, output_bytes,
@@ -608,7 +655,8 @@ export function stageTranscriptSources(options: StageOptions): StageResult {
     const indexReadLatencyMs = performance.now() - indexReadStarted;
     return {
       status, stopReason, insertedTranscripts, insertedEvents, captureRevisions,
-      unchangedSources, skippedSources, errorCount, lastCommittedSource,
+      unchangedSources, skippedSources, policyDeferredSources, errorCount,
+      lastCommittedSource: captureDecision(readCapturePolicy(), null).allowed ? lastCommittedSource : null,
       metrics: {
         durationMs,
         inputBytes,
@@ -633,7 +681,7 @@ export function searchTranscriptHistory(
   input: HistorySearchInput,
 ): HistorySearchResult {
   if (!existsSync(dbPath)) throw new Error('Transcript history index is unavailable');
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     const limit = input.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
@@ -641,8 +689,9 @@ export function searchTranscriptHistory(
     }
     const query = ftsQuery(input.query);
     const revision = currentRevision(db);
+    const policyFingerprint = readCapturePolicy().fingerprint;
     const cursorKey = sha256(JSON.stringify({
-      query, runtime: input.runtime ?? null, project: input.project ?? null,
+      policyFingerprint, query, runtime: input.runtime ?? null, project: input.project ?? null,
       from: input.from ?? null, to: input.to ?? null,
       include_children: input.include_children ?? false, limit,
     }));
@@ -702,8 +751,8 @@ export function searchTranscriptHistory(
       authority: 'historical_untrusted' as const,
     }));
     return {
-      results: page,
-      next_cursor: hasMore ? encodeCursor({ revision, key: cursorKey, offset: offset + limit }) : null,
+      results: readCapturePolicy().fingerprint === policyFingerprint ? page : [],
+      next_cursor: hasMore && readCapturePolicy().fingerprint === policyFingerprint ? encodeCursor({ revision, key: cursorKey, offset: offset + limit }) : null,
       authority: 'historical_untrusted',
     };
   } finally {
@@ -712,7 +761,7 @@ export function searchTranscriptHistory(
 }
 
 export function historyStats(dbPath: string): HistoryStats {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     const count = (table: string) => (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
     return {
@@ -729,7 +778,7 @@ export function historyStats(dbPath: string): HistoryStats {
 }
 
 export function getCaptureKinds(dbPath: string, transcriptId: string): string[] {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return (db.prepare(`
       SELECT capture_kind FROM history_captures
@@ -741,7 +790,7 @@ export function getCaptureKinds(dbPath: string, transcriptId: string): string[] 
 }
 
 export function listUnmatchedSources(dbPath: string): Array<Record<string, unknown>> {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return db.prepare(`
       SELECT source_path, provider, provider_session_id, source_kind, reason
@@ -754,7 +803,7 @@ export function listUnmatchedSources(dbPath: string): Array<Record<string, unkno
 }
 
 export function listSourceLedger(dbPath: string): Array<Record<string, unknown>> {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return db.prepare(`
       SELECT source_path, provider, provider_session_id, source_kind,
@@ -776,12 +825,14 @@ export function ensureHistoryInventoryLedger(
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) {
     throw new Error('maxOutputBytes must be a positive integer');
   }
+  if (!captureDecision(readCapturePolicy(), null).allowed) return 0;
   const db = openHistoryDb(dbPath);
   const marker = `inventory_receipt:${sha256(inventoryReceipt)}`;
   try {
     if (db.prepare('SELECT 1 FROM history_meta WHERE key = ?').get(marker)) return 0;
     let inserted = 0;
     db.transaction(() => {
+      requireUnboundHistoryAllowed([dbPath]);
       const statement = db.prepare(`
         INSERT OR IGNORE INTO history_source_ledger (
           source_path, provider, provider_session_id, source_kind,
@@ -799,6 +850,7 @@ export function ensureHistoryInventoryLedger(
       if (databaseBytes(db) + auxiliaryDatabaseBytes(dbPath) > maxOutputBytes) {
         throw new CeilingError('max_output_bytes');
       }
+      requireUnboundHistoryAllowed([dbPath]);
     })();
     return inserted;
   } finally {
@@ -807,7 +859,7 @@ export function ensureHistoryInventoryLedger(
 }
 
 export function listAcceptedSourceReceipts(dbPath: string): string[] {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return (db.prepare(`
       SELECT DISTINCT source_path FROM history_captures
@@ -820,7 +872,7 @@ export function listAcceptedSourceReceipts(dbPath: string): string[] {
 }
 
 export function listProcessedSourceReceipts(dbPath: string): string[] {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return (db.prepare(`
       SELECT DISTINCT source_path FROM history_captures
@@ -833,7 +885,7 @@ export function listProcessedSourceReceipts(dbPath: string): string[] {
 }
 
 export function listBlockedSourceReceipts(dbPath: string): string[] {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return (db.prepare(`
       SELECT DISTINCT source_path FROM history_captures
@@ -854,7 +906,7 @@ export interface SourceReceiptState {
 }
 
 export function listSourceReceiptStates(dbPath: string): SourceReceiptState[] {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openHistoryReadDb(dbPath);
   try {
     return db.prepare(`
       SELECT c.source_path, c.status, c.size_bytes, c.mtime_ms,
@@ -885,6 +937,7 @@ export function recordIdenticalArchiveReceipt(dbPath: string, input: {
   receiptMtimeMs: number;
   inventoryFingerprint: string;
 }): boolean {
+  requireUnboundHistoryAllowed([dbPath, input.path]);
   if (!existsSync(dbPath)) return false;
   const db = openHistoryDb(dbPath);
   try {
@@ -904,6 +957,7 @@ export function recordIdenticalArchiveReceipt(dbPath: string, input: {
         'duplicate', 'accepted', input.path, input.receiptMtimeMs, input.inventoryFingerprint,
       );
       bumpRevision(db);
+      requireUnboundHistoryAllowed([dbPath, input.path]);
     })();
     return true;
   } finally {
@@ -924,9 +978,11 @@ export function recordOversizedSourceReceipt(dbPath: string, input: {
   receiptMtimeMs: number;
   inventoryFingerprint: string;
 }): void {
+  requireUnboundHistoryAllowed([dbPath]);
   const db = openHistoryDb(dbPath);
   try {
     db.transaction(() => {
+      requireUnboundHistoryAllowed([dbPath]);
       insertCapture(
         db, `oversized:${input.receiptPath}`, input.receiptPath, OVERSIZED_SOURCE_REASON,
         input.sizeBytes, OVERSIZED_SOURCE_REASON, 'blocked', input.receiptPath,
@@ -936,6 +992,7 @@ export function recordOversizedSourceReceipt(dbPath: string, input: {
         provider: input.provider, runtime: input.runtime, path: input.receiptPath, sourceKind: 'nas_archive',
       }, null, false, `blocked_${OVERSIZED_SOURCE_REASON}`);
       bumpRevision(db);
+      requireUnboundHistoryAllowed([dbPath]);
     })();
   } finally {
     db.close();
@@ -963,7 +1020,9 @@ export function tombstoneTranscript(dbPath: string, transcriptId: string, reason
 export function rebuildHistorySearch(dbPath: string): void {
   const db = openHistoryDb(dbPath);
   try {
+    installHistoryCaptureViews(db);
     db.transaction(() => {
+      const policy = readCapturePolicy().fingerprint;
       db.exec('DELETE FROM history_fts');
       db.exec(`
         INSERT INTO history_fts (event_id, transcript_id, content)
@@ -972,6 +1031,7 @@ export function rebuildHistorySearch(dbPath: string): void {
         LEFT JOIN history_tombstones t ON t.transcript_id = e.transcript_id
         WHERE t.transcript_id IS NULL
       `);
+      if (readCapturePolicy().fingerprint !== policy) throw new HistoryCaptureBlocked();
     })();
   } finally {
     db.close();
@@ -1079,16 +1139,19 @@ function tryParseSource(
   source: HistorySource,
   expectedBytes: number,
   maxPayloadBytes: number,
-): { parsed: ParsedTranscript; hash: string; peakBufferBytes: number; maxRecordBytes: number }
+  dbPath: string,
+): { parsed: ParsedTranscript; hash: string; captureSources: CaptureSource[]; peakBufferBytes: number; maxRecordBytes: number }
   | { error: string; peakBufferBytes: number; maxRecordBytes: number } {
   let peakBufferBytes = 0;
   let maxRecordBytes = 0;
   try {
+    const capture = new HistoryCaptureCollector(source, dbPath);
     let codexMeta: Record<string, any> | undefined;
     let firstClaudeSession: Record<string, any> | undefined;
     let claudeSidechain = false;
     const claudeAgentIds = new Set<string>();
     const metadataScan = scanJsonl(source.path, maxPayloadBytes, row => {
+      capture.visit(row);
       if (source.provider === 'codex') {
         if (!codexMeta && row.type === 'session_meta') codexMeta = row;
         return;
@@ -1102,6 +1165,7 @@ function tryParseSource(
     peakBufferBytes = metadataScan.peakBufferBytes;
     maxRecordBytes = metadataScan.maxRecordBytes;
     if (metadataScan.bytesRead !== expectedBytes) throw new Error('source_changed_during_read');
+    const captureSources = capture.requireAllowed(metadataScan.hash);
 
     let providerSessionId: string;
     let parentTranscriptId: string | null;
@@ -1159,8 +1223,10 @@ function tryParseSource(
     if (source.expectedSessionId && source.expectedSessionId !== parsed.providerSessionId) {
       return { error: 'archive_session_id_mismatch', peakBufferBytes, maxRecordBytes };
     }
-    return { parsed, hash: metadataScan.hash, peakBufferBytes, maxRecordBytes };
+    capture.requireAllowed(metadataScan.hash);
+    return { parsed, hash: metadataScan.hash, captureSources, peakBufferBytes, maxRecordBytes };
   } catch (error) {
+    if (error instanceof HistoryCaptureBlocked) throw error;
     return {
       error: error instanceof Error ? error.message : String(error),
       peakBufferBytes,
@@ -1228,7 +1294,7 @@ function scanJsonl(
   maxPayloadBytes: number,
   visit: (row: Record<string, any>) => void,
 ): { bytesRead: number; hash: string; peakBufferBytes: number; maxRecordBytes: number } {
-  const handle = openSync(path, 'r');
+  const handle = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   const chunk = Buffer.allocUnsafe(SOURCE_READ_CHUNK_BYTES);
   const hasher = createHash('sha256');
   // A partial record is held as a list of copied chunks and joined once, when its newline
@@ -1248,13 +1314,15 @@ function scanJsonl(
     if (line.length > maxPayloadBytes) throw new Error(`max_payload_bytes:line_${lineNumber}`);
     maxRecordBytes = Math.max(maxRecordBytes, line.length);
     let row: Record<string, any>;
-    try { row = JSON.parse(line.toString('utf8')) as Record<string, any>; }
+    try { row = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line)) as Record<string, any>; }
     catch { throw new Error(`malformed_jsonl:line_${lineNumber}`); }
     rowCount += 1;
     visit(row);
   };
 
   try {
+    const before = fstatSync(handle);
+    if (!before.isFile() || before.uid !== process.getuid?.()) throw new Error('source_not_owned_regular_file');
     while (true) {
       const count = readSync(handle, chunk, 0, chunk.length, null);
       if (count === 0) break;
@@ -1286,6 +1354,8 @@ function scanJsonl(
     }
     if (pendingBytes > 0) parseLine(Buffer.concat(pending, pendingBytes));
     if (rowCount === 0) throw new Error('empty_source');
+    const after = fstatSync(handle);
+    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new Error('source_changed_during_read');
     return { bytesRead, hash: hasher.digest('hex'), peakBufferBytes, maxRecordBytes };
   } finally {
     closeSync(handle);
@@ -1480,6 +1550,8 @@ function conductorJoin(
 }
 
 function recordStageSkip(db: Database.Database, source: HistorySource, reason: string): void {
+  db.transaction(() => {
+  requireUnboundHistoryAllowed([db.name, source.path]);
   db.prepare(`
     INSERT INTO history_source_ledger (
       source_path, provider, provider_session_id, source_kind,
@@ -1490,6 +1562,8 @@ function recordStageSkip(db: Database.Database, source: HistorySource, reason: s
     source.receiptPath ?? source.path, source.provider, source.expectedSessionId ?? null,
     source.sourceKind ?? 'local', reason, new Date().toISOString(),
   );
+  requireUnboundHistoryAllowed([db.name, source.path]);
+  })();
 }
 
 function upsertSourceLedger(
@@ -1523,6 +1597,8 @@ function recordStageError(
   currentErrors: number,
   maxErrors: number,
 ): { status: StageResult['status']; stopReason: string | null; errorCount: number } {
+  db.transaction(() => {
+  requireUnboundHistoryAllowed([db.name, source.path]);
   db.prepare(`
     INSERT INTO history_source_ledger (
       source_path, provider, provider_session_id, source_kind,
@@ -1533,6 +1609,8 @@ function recordStageError(
     source.receiptPath ?? source.path, source.provider, source.expectedSessionId ?? null,
     source.sourceKind ?? 'local', reason, new Date().toISOString(),
   );
+  requireUnboundHistoryAllowed([db.name, source.path]);
+  })();
   const errorCount = currentErrors + 1;
   return errorCount > maxErrors
     ? { status: 'stopped', stopReason: reason, errorCount }

@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { SELF_ADMISSION_POLICY_VERSION, SELF_ADMISSION_REASON } from './admission.js';
-import { claimUnsupported, fileClaimVerdicts, type ClaimVerdictLookup } from './claim-verdicts.js';
+import { ClaimReviewDeferred, claimUnsupported, fileClaimVerdicts, type ClaimVerdictLookup } from './claim-verdicts.js';
 import { NOTE_CLAIMS_PREFIX, fileNoteClaims, findNoteClaim, type NoteClaimsLookup } from './note-claims.js';
 
 /**
@@ -310,7 +310,12 @@ export function planClaimRetirement(db: Database.Database, now: string, lookup: 
     // A vault note's claim lives in the note-claims sidecar instead of its frontmatter.
     const passages = claim?.passages ?? findNoteClaim(notes, r.source_node_id, r, r.content ?? '')?.passages;
     if (!Array.isArray(passages) || !passages.every(p => typeof p === 'string')) continue;
-    if (!claimUnsupported(lookup, r.source_node_id, r, passages as string[])) continue;
+    try {
+      if (!claimUnsupported(lookup, r.source_node_id, r, passages as string[])) continue;
+    } catch (error) {
+      if (error instanceof ClaimReviewDeferred) return [];
+      throw error;
+    }
     const prior = stateOf(r);
     actions.push({ kind: 'retire_unsupported', assertion_id: r.id, prior,
       after: { status: 'retracted', valid_to: prior.valid_to, superseded_by: prior.superseded_by, updated_at: now } });

@@ -6,11 +6,12 @@ import {
   createReadStream,
   existsSync,
   mkdirSync,
-  renameSync,
+  linkSync,
   rmSync,
   statSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
+import { CorpusReadScope } from './corpus-read-consistency.js';
 import { FEDERATED_CORPUS_REQUIRED_TABLES } from './federated-corpus.js';
 import {
   activeVersionFromText,
@@ -43,6 +44,7 @@ export interface CorpusSemanticIndexReceipt {
   collectionId: string;
   sourceDatabasePath: string;
   sourceDatabaseSha256: string;
+  sourceDigestFormat: 'file-sha256' | 'sqlite-base-wal.v1';
   sourceDatabaseSize: number;
   sourceDatabaseChangedDuringBuild: boolean;
   indexPath: string;
@@ -59,13 +61,8 @@ export interface QueryCorpusSemanticIndexOptions {
   expectedCollectionId: string;
   expectedSourceDatabaseSha256: string;
   limit: number;
-}
-
-interface SourceIdentity {
-  device: number;
-  inode: number;
-  size: number;
-  modifiedMs: number;
+  expectedModel?: string;
+  expectedModelRevision?: string;
 }
 
 interface SourceSegmentRow {
@@ -92,54 +89,68 @@ export async function buildCorpusSemanticIndex(
 ): Promise<CorpusSemanticIndexReceipt> {
   validateBuildInput(input);
   if (existsSync(input.indexPath)) throw new Error(`Semantic index already exists: ${input.indexPath}`);
-  const before = fileIdentity(input.sourceDatabasePath);
-  const sourceDatabaseSha256 = await sha256File(input.sourceDatabasePath);
-  const rows = readSourceSegments(input.sourceDatabasePath, input.selection);
-  const embedded: EmbeddedRow[] = [];
-  for (const row of rows) {
-    const embedding = await input.provider.embed(`${row.title}\n${row.text}`.slice(0, 8000));
-    validateEmbedding(embedding, input.provider.dimension);
-    embedded.push({
-      ...row,
-      activeVersion: activeVersionFromText(row.text),
-      citation: citationFor(row),
-      embedding,
-    });
-  }
-
-  mkdirSync(dirname(input.indexPath), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${input.indexPath}.${process.pid}.${randomUUID()}.tmp`;
+  const scope = new CorpusReadScope();
   try {
-    writeIndex(temporaryPath, input, sourceDatabaseSha256, before.size, embedded);
-    chmodSync(temporaryPath, 0o600);
-    const after = fileIdentity(input.sourceDatabasePath);
-    if (!sameIdentity(before, after)) {
-      throw new Error('Source database changed during semantic index build');
+    const source = scope.database(input.sourceDatabasePath);
+    const before = { size: source.size };
+    const sourceDatabaseSha256 = await source.digest();
+    const rows = readSourceSegments(source.db, input.selection);
+    const profile = JSON.stringify([input.provider.model, input.provider.revision, input.provider.dimension]);
+    const check = () => {
+      scope.assertCurrent();
+      if (profile !== JSON.stringify([input.provider.model, input.provider.revision, input.provider.dimension])) throw new Error('Embedding profile changed during build');
+    };
+    const embedded: EmbeddedRow[] = [];
+    for (const row of rows) {
+      check();
+      const embedding = await input.provider.embed(`${row.title}\n${row.text}`.slice(0, 8000));
+      check();
+      validateEmbedding(embedding, input.provider.dimension);
+      embedded.push({
+        ...row,
+        activeVersion: activeVersionFromText(row.text),
+        citation: citationFor(row),
+        embedding,
+      });
     }
-    renameSync(temporaryPath, input.indexPath);
-  } catch (error) {
-    rmSync(temporaryPath, { force: true });
-    throw error;
-  }
 
-  const indexStat = statSync(input.indexPath);
-  return {
-    schema: 'corpus-semantic-index-receipt.v1',
-    generatedAt: new Date().toISOString(),
-    collectionId: input.collectionId,
-    sourceDatabasePath: input.sourceDatabasePath,
-    sourceDatabaseSha256,
-    sourceDatabaseSize: before.size,
-    sourceDatabaseChangedDuringBuild: false,
-    indexPath: input.indexPath,
-    indexSha256: await sha256File(input.indexPath),
-    indexSize: indexStat.size,
-    indexedSegments: embedded.length,
-    selection: input.selection,
-    model: input.provider.model,
-    modelRevision: input.provider.revision,
-    dimension: input.provider.dimension,
-  };
+    mkdirSync(dirname(input.indexPath), { recursive: true, mode: 0o700 });
+    const temporaryPath = `${input.indexPath}.${process.pid}.${randomUUID()}.tmp`;
+    let indexSha256: string;
+    try {
+      check();
+      writeIndex(temporaryPath, input, sourceDatabaseSha256, source.digestFormat, before.size, embedded);
+      chmodSync(temporaryPath, 0o600);
+      indexSha256 = await sha256File(temporaryPath);
+      check();
+      // A concurrent publisher keeps its complete file. Never replace it.
+      linkSync(temporaryPath, input.indexPath);
+      rmSync(temporaryPath);
+    } catch (error) {
+      rmSync(temporaryPath, { force: true });
+      throw error;
+    }
+
+    const indexStat = statSync(input.indexPath);
+    return {
+      schema: 'corpus-semantic-index-receipt.v1',
+      generatedAt: new Date().toISOString(),
+      collectionId: input.collectionId,
+      sourceDatabasePath: input.sourceDatabasePath,
+      sourceDatabaseSha256,
+      sourceDigestFormat: source.digestFormat,
+      sourceDatabaseSize: before.size,
+      sourceDatabaseChangedDuringBuild: false,
+      indexPath: input.indexPath,
+      indexSha256,
+      indexSize: indexStat.size,
+      indexedSegments: embedded.length,
+      selection: input.selection,
+      model: input.provider.model,
+      modelRevision: input.provider.revision,
+      dimension: input.provider.dimension,
+    };
+  } finally { scope.close(); }
 }
 
 export function queryCorpusSemanticIndex(
@@ -161,6 +172,10 @@ export function queryCorpusSemanticIndex(
     if (metadata.source_database_sha256 !== options.expectedSourceDatabaseSha256) {
       throw new Error('Semantic index source database digest mismatch');
     }
+    if ((options.expectedModel !== undefined && metadata.model !== options.expectedModel)
+      || (options.expectedModelRevision !== undefined && metadata.model_revision !== options.expectedModelRevision)) {
+      throw new Error('Semantic index embedding profile mismatch');
+    }
     const dimension = Number(metadata.dimension);
     validateEmbedding(queryEmbedding, dimension);
     const rows = db.prepare(`
@@ -170,7 +185,7 @@ export function queryCorpusSemanticIndex(
       JOIN indexed_segments s ON s.id = v.rowid
       WHERE v.embedding MATCH ? AND k = ?
       ORDER BY v.distance, s.segment_id
-    `).all(Buffer.from(queryEmbedding.buffer), options.limit) as Array<{
+    `).all(Buffer.from(queryEmbedding.buffer, queryEmbedding.byteOffset, queryEmbedding.byteLength), options.limit) as Array<{
       segment_id: number;
       document_id: number;
       source_id: string;
@@ -217,10 +232,7 @@ function validateBuildInput(input: BuildCorpusSemanticIndexInput): void {
   }
 }
 
-function readSourceSegments(path: string, selection: CorpusIndexSelection): SourceSegmentRow[] {
-  const db = new Database(path, { readonly: true, fileMustExist: true });
-  db.pragma('query_only = ON');
-  try {
+function readSourceSegments(db: Database.Database, selection: CorpusIndexSelection): SourceSegmentRow[] {
     validateSourceSchema(db);
     const direction = selection.order === 'ascending' ? 'ASC' : 'DESC';
     return db.prepare(`
@@ -232,9 +244,6 @@ function readSourceSegments(path: string, selection: CorpusIndexSelection): Sour
       ORDER BY s.id ${direction}
       LIMIT ?
     `).all(selection.maxSegments) as SourceSegmentRow[];
-  } finally {
-    db.close();
-  }
 }
 
 function validateSourceSchema(db: Database.Database): void {
@@ -252,6 +261,7 @@ function writeIndex(
   path: string,
   input: BuildCorpusSemanticIndexInput,
   sourceDatabaseSha256: string,
+  sourceDigestFormat: string,
   sourceDatabaseSize: number,
   rows: EmbeddedRow[],
 ): void {
@@ -278,6 +288,7 @@ function writeIndex(
       schema: 'corpus-semantic-index.v1',
       collection_id: input.collectionId,
       source_database_sha256: sourceDatabaseSha256,
+      source_digest_format: sourceDigestFormat,
       source_database_size: String(sourceDatabaseSize),
       model: input.provider.model,
       model_revision: input.provider.revision,
@@ -307,7 +318,7 @@ function writeIndex(
           row.activeVersion === null ? null : row.activeVersion ? 1 : 0,
           row.updated_at,
         );
-        insertVector.run(BigInt(id), Buffer.from(row.embedding.buffer));
+        insertVector.run(BigInt(id), Buffer.from(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength));
       });
     })();
   } finally {
@@ -340,19 +351,6 @@ function validateEmbedding(value: Float32Array, dimension: number): void {
     || value.some(item => !Number.isFinite(item))) {
     throw new Error(`Embedding must contain ${dimension} finite float32 values`);
   }
-}
-
-function fileIdentity(path: string): SourceIdentity {
-  const value = statSync(path);
-  if (!value.isFile()) throw new Error(`Corpus database is not a file: ${path}`);
-  return { device: value.dev, inode: value.ino, size: value.size, modifiedMs: value.mtimeMs };
-}
-
-function sameIdentity(left: SourceIdentity, right: SourceIdentity): boolean {
-  return left.device === right.device
-    && left.inode === right.inode
-    && left.size === right.size
-    && left.modifiedMs === right.modifiedMs;
 }
 
 function sha256File(path: string): Promise<string> {

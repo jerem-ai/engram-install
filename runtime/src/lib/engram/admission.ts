@@ -1,9 +1,10 @@
+import { statementContext } from "../../../hooks/statement-context.mjs";
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { VaultWriter } from '../writer.js';
 import { insertAssertion, type EngramAssertion } from './assertions.js';
 import { normalizeTemporalInstant } from './temporal.js';
-import { claimUnsupported, fileClaimVerdicts, type ClaimVerdictLookup } from './claim-verdicts.js';
+import { ClaimReviewDeferred, claimUnsupported, fileClaimVerdicts, type ClaimVerdictLookup } from './claim-verdicts.js';
 import { NOTE_CLAIMS_PREFIX, fileNoteClaims, findNoteClaim, type NoteClaimsLookup } from './note-claims.js';
 import type { ToolAuthorizer } from '../../security/authorization.js';
 import type { VerifiedRequestIdentity } from '../../security/request-identity.js';
@@ -145,6 +146,8 @@ export interface MemoryAdmissionServiceOptions {
   receiptKey: Uint8Array;
   authorizer?: ToolAuthorizer;
   now?: () => number;
+  /** Trusted replay configuration: use the frozen service clock for assertion writes too. */
+  freezeWriteTimestamps?: boolean;
   /** Admit agent-written facts automatically on submission and indexing. The production factory turns this on. */
   selfAdmission?: boolean;
   /** Per-claim review verdicts (claim-verdicts.ts). Default: the sidecar file; only qualified verdicts count. */
@@ -195,6 +198,11 @@ export type CandidateSubmission =
   | { status: 'quarantined'; candidate: MemoryCandidate }
   | { status: 'rejected'; reason: 'credential_detected'; receiptId: string };
 
+export type PreparedCandidateSubmission =
+  | { status: 'prepared'; candidate: MemoryCandidate }
+  | { status: 'rejected'; reason: 'credential_detected'; receiptId: string;
+      origin: MemoryOrigin; contentAlias: string; createdAt: string };
+
 export class MemoryAdmissionService {
   private readonly now: () => number;
   private readonly claimVerdicts: ClaimVerdictLookup;
@@ -213,7 +221,12 @@ export class MemoryAdmissionService {
     return this.options.selfAdmission === true;
   }
 
-  submit(db: Database.Database, input: CandidateInput): CandidateSubmission {
+  selfAdmissionReceiptId(candidateId: string, timestamp: string): string {
+    return this.alias('self-admission', `${opaqueText('candidateId', candidateId)}\u001f${normalizeTemporalInstant(timestamp)}`);
+  }
+
+  /** Compute the exact candidate identity and fields without writing any row. */
+  prepareSubmission(db: Database.Database, input: CandidateInput): PreparedCandidateSubmission {
     const origin = validateOrigin(input.origin);
     const subject = boundedText('subject', input.subject);
     const predicate = boundedText('predicate', input.predicate);
@@ -228,16 +241,33 @@ export class MemoryAdmissionService {
 
     if (containsCredential(credentialMaterial)) {
       const id = this.alias('credential-rejection', `${origin}\u001f${contentAlias}\u001f${sourceHash}`);
+      return { status: 'rejected', reason: 'credential_detected', receiptId: id,
+        origin, contentAlias, createdAt: now };
+    }
+
+    const context = db.prepare('SELECT current_tenant_id() AS tenant, current_principal_id() AS principal').get() as
+      { tenant: string; principal: string };
+    return { status: 'prepared', candidate: {
+      tenant_id: context.tenant, owner_principal_id: context.principal,
+      id: this.alias('candidate', `${origin}\u001f${material}\u001f${confidence}\u001f${sourceHash}`),
+      origin, trust_state: 'quarantined', sensitivity: classifySensitivity(material),
+      subject, predicate, object, confidence, source_node_id: sourceNodeId, source_hash: sourceHash,
+      policy_version: MEMORY_ADMISSION_POLICY_VERSION, created_at: now, updated_at: now,
+      reviewed_by_principal_id: null, reviewed_at: null, review_reason: null, assertion_id: null,
+    } };
+  }
+
+  submit(db: Database.Database, input: CandidateInput): CandidateSubmission {
+    const prepared = this.prepareSubmission(db, input);
+    if (prepared.status === 'rejected') {
       db.prepare(`
         INSERT OR IGNORE INTO records_engram_memory_rejections
           (tenant_id, owner_principal_id, id, origin, reason, content_alias, policy_version, created_at)
         VALUES (current_tenant_id(), current_principal_id(), ?, ?, 'credential_detected', ?, ?, ?)
-      `).run(id, origin, contentAlias, MEMORY_ADMISSION_POLICY_VERSION, now);
-      return { status: 'rejected', reason: 'credential_detected', receiptId: id };
+      `).run(prepared.receiptId, prepared.origin, prepared.contentAlias, MEMORY_ADMISSION_POLICY_VERSION, prepared.createdAt);
+      return { status: 'rejected', reason: 'credential_detected', receiptId: prepared.receiptId };
     }
-
-    const sensitivity = classifySensitivity(material);
-    const id = this.alias('candidate', `${origin}\u001f${material}\u001f${confidence}\u001f${sourceHash}`);
+    const candidate = prepared.candidate;
     db.prepare(`
       INSERT INTO records_engram_memory_candidates
         (tenant_id, owner_principal_id, id, origin, trust_state, sensitivity,
@@ -247,10 +277,11 @@ export class MemoryAdmissionService {
         ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
     `).run(
-      id, origin, sensitivity, subject, predicate, object, confidence, sourceNodeId,
-      sourceHash, MEMORY_ADMISSION_POLICY_VERSION, now, now,
+      candidate.id, candidate.origin, candidate.sensitivity, candidate.subject, candidate.predicate, candidate.object,
+      candidate.confidence, candidate.source_node_id, candidate.source_hash, candidate.policy_version,
+      candidate.created_at, candidate.updated_at,
     );
-    return { status: 'quarantined', candidate: getMemoryCandidate(db, id)! };
+    return { status: 'quarantined', candidate: getMemoryCandidate(db, candidate.id)! };
   }
 
   promote(
@@ -328,8 +359,13 @@ export class MemoryAdmissionService {
       // (extraction/support_check.py). Its claims stay quarantined; `unchecked` is not a verdict.
       if (memorySupportVerdict(db, candidate.source_node_id) === 'unsupported') return held('source_unsupported');
       // Per-claim review: a qualified reviewer found this claim's own passages do not back it.
-      if (claimUnsupported(this.claimVerdicts, evidence.source_node_id, candidate as { subject: string; predicate: string; object: string },
-        evidence.passages)) return held('claim_unsupported');
+      try {
+        if (claimUnsupported(this.claimVerdicts, evidence.source_node_id, candidate as { subject: string; predicate: string; object: string },
+          evidence.passages)) return held('claim_unsupported');
+      } catch (error) {
+        if (error instanceof ClaimReviewDeferred) return held('source_unbound');
+        throw error;
+      }
     } else {
       // The candidate note Engram writes for a submission (EngramCandidates/) is
       // not evidence; before 2026-10-04 every source-less fact cited one and passed.
@@ -353,7 +389,7 @@ export class MemoryAdmissionService {
     // ("Jeremy prefers X" and "Jeremy prefers Y"). Holding on it kept 207 of
     // 2,991 real preferences and rules out of recall in the October 4 trial.
     const principalId = (db.prepare('SELECT current_principal_id() AS p').get() as { p: string }).p;
-    const receiptId = this.alias('self-admission', `${candidate.id}\u001f${now}`);
+    const receiptId = this.selfAdmissionReceiptId(candidate.id, now);
     const admitted = this.writeAdmission(db, candidate, {
       now, validFrom, validTo, status, evidence, principalId, reasonCode: SELF_ADMISSION_REASON,
       policyVersion: SELF_ADMISSION_POLICY_VERSION, receiptId, mode, writer: opts.writer, checkExistingValidity: false,
@@ -491,7 +527,7 @@ export class MemoryAdmissionService {
         source_node_id: sourceNodeId,
         valid_from: w.validFrom,
         valid_to: w.validTo,
-      });
+      }, this.options.freezeWriteTimestamps ? w.now : undefined);
       if (w.mode === 'note') {
         const sourceDigest = computeMemorySourceDigest(db, sourceNodeId);
         db.prepare(`
@@ -704,6 +740,11 @@ export function computeMemorySourceDigest(db: Database.Database, sourceNodeId: s
     id: string; title: string; content: string | null; frontmatter: string;
   } | undefined;
   if (!source) return '';
+  return memorySourceDigest(source);
+}
+
+/** Same source binding for a frozen, not-yet-indexed node. */
+export function memorySourceDigest(source: { id: string; title: string; content: string | null; frontmatter: string }): string {
   return createHash('sha256')
     .update(source.id).update('\0')
     .update(source.title).update('\0')
@@ -738,7 +779,8 @@ export function getNoteClaimEvidence(db: Database.Database, candidate: MemoryCan
       source_session: typeof fm.session_id === 'string' ? fm.session_id : rec?.session_id ?? null,
       source_created: fm.created ?? fm.date ?? null,
       valid_from: claim.valid_from ?? null, valid_to: claim.valid_to ?? null,
-      passages: claim.passages, authority: MEMORY_AUTHORITY };
+      passages: claim.passages, statement_context: statementContext(fm),
+      source_turns: fm.metadata?.source_turns ?? null, authority: MEMORY_AUTHORITY };
     if (containsCredential(JSON.stringify(evidence))) throw new Error('Credential-shaped source evidence cannot be promoted');
     return evidence;
   })();
@@ -770,7 +812,8 @@ export function getMemoryCandidateEvidence(db: Database.Database, candidate: Mem
         : typeof fm.reviewed_evidence?.source_session === 'string' ? fm.reviewed_evidence.source_session : null,
       source_created: fm.created ?? fm.metadata?.created ?? null,
       valid_from: claim.valid_from ?? null, valid_to: claim.valid_to ?? null,
-      passages: claim.passages as string[], authority: MEMORY_AUTHORITY };
+      passages: claim.passages as string[], statement_context: statementContext(fm),
+      source_turns: fm.metadata?.source_turns ?? null, authority: MEMORY_AUTHORITY };
     if (containsCredential(JSON.stringify(evidence))) throw new Error('Credential-shaped source evidence cannot be promoted');
     return evidence;
   })();
@@ -855,7 +898,7 @@ export function containsCredential(material: string): boolean {
   return patterns.some(pattern => pattern.test(material));
 }
 
-function memorySupportVerdict(db: Database.Database, nodeId: string | null): string | null {
+export function memorySupportVerdict(db: Database.Database, nodeId: string | null): string | null {
   if (!nodeId) return null;
   const row = db.prepare('SELECT frontmatter FROM nodes WHERE id = ?').get(nodeId) as { frontmatter: string } | undefined;
   try {

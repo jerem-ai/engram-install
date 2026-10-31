@@ -1,6 +1,6 @@
 import { AutoModelForSequenceClassification, AutoTokenizer } from '@huggingface/transformers';
 import { getEmbeddingModelCacheDir, withModelCachePopulationLock } from './model-cache.js';
-import { splitPassages, type PassageSource } from './passage-rescore.js';
+import { splitPassages, type PassageSource, type ReadCurrent } from './passage-rescore.js';
 
 /**
  * Answer verification for memory search. A cross-encoder reads the query and
@@ -14,7 +14,7 @@ const MAX_TOKENS = 256;
 
 export interface AnswerScorer {
   /** Best passage logit per note for the query. */
-  best(query: string, notes: PassageSource[]): Promise<Map<string, number>>;
+  best(query: string, notes: PassageSource[], current?: ReadCurrent): Promise<Map<string, number>>;
 }
 
 class CrossEncoderScorer implements AnswerScorer {
@@ -32,16 +32,20 @@ class CrossEncoderScorer implements AnswerScorer {
     return this.loaded;
   }
 
-  async best(query: string, notes: PassageSource[]): Promise<Map<string, number>> {
+  async best(query: string, notes: PassageSource[], current: ReadCurrent = () => true): Promise<Map<string, number>> {
+    if (!current()) return new Map();
     const { tokenizer, model } = await this.load();
     const out = new Map<string, number>();
     for (const note of notes) {
+      if (!current()) return new Map();
       const passages = splitPassages(note.title, note.content);
       if (passages.length === 0) continue;
       const inputs = tokenizer(new Array(passages.length).fill(query), {
         text_pair: passages, padding: true, truncation: true, max_length: MAX_TOKENS,
       });
+      if (!current()) return new Map();
       const { logits } = await model(inputs);
+      if (!current()) return new Map();
       out.set(note.id, Math.max(...(logits.data as Float32Array)));
     }
     return out;

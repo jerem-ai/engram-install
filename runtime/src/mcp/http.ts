@@ -42,6 +42,7 @@ const { app } = createKgHttpApp({
   allowedHosts: ALLOWED_HOSTS,
   createServer: () => createKgServer({ readOnly: true }),
   memorySearch: searchLocalMemory,
+  memoryPerformance: process.env.ENGRAM_PERFORMANCE_TRACE === '1',
   streamable: {
     ttlMs: positiveInt(process.env.KG_HTTP_SESSION_TTL_MS, 30 * 60_000),
     maxSessions: positiveInt(process.env.KG_HTTP_MAX_SESSIONS, 128),

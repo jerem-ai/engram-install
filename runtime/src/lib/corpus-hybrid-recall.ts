@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import {
   recallFederatedEvidence,
+  invalidateCorpusEvidence,
   type FederatedEvidence,
   type FederatedRecallResult,
 } from './federated-corpus.js';
@@ -15,6 +16,7 @@ import {
   queryCorpusSemanticIndex,
   type CorpusEmbeddingProvider,
 } from './corpus-semantic-index.js';
+import { CorpusReadScope } from './corpus-read-consistency.js';
 
 const MAX_FUSION_CANDIDATES = 12;
 
@@ -22,23 +24,35 @@ export interface HybridCorpusRecallInput {
   collectionId: string;
   domain: string;
   databasePath: string;
-  sourceDatabaseSha256: string;
+  sourceDatabaseSha256?: string;
   semanticIndexPath: string;
   provider: CorpusEmbeddingProvider;
   query: string;
   limit: number;
   semanticMinSimilarity: number;
+  readScope?: CorpusReadScope;
 }
 
 export interface HybridCorpusRecallExecution {
   mode: 'hybrid' | 'lexical_degraded';
-  semanticError?: 'semantic_index_unavailable' | 'semantic_index_invalid';
+  semanticError?: 'semantic_index_unavailable' | 'semantic_index_invalid' | 'source_changed';
   result: FederatedRecallResult;
 }
 
 export async function recallHybridCorpus(
   input: HybridCorpusRecallInput,
 ): Promise<HybridCorpusRecallExecution> {
+  const scope = input.readScope ?? new CorpusReadScope();
+  try {
+    const execution = await recallHybridCorpusWithinScope(input, scope);
+    return scope.current() ? execution : {
+      mode: 'lexical_degraded', semanticError: 'source_changed', result: invalidateCorpusEvidence(execution.result),
+    };
+  }
+  finally { if (!input.readScope) scope.close(); }
+}
+
+async function recallHybridCorpusWithinScope(input: HybridCorpusRecallInput, scope: CorpusReadScope): Promise<HybridCorpusRecallExecution> {
   const cleanQuery = input.query.trim();
   const limit = normalizeLimit(input.limit);
   const lexicalResult = recallFederatedEvidence(
@@ -46,6 +60,7 @@ export async function recallHybridCorpus(
     input.databasePath,
     cleanQuery,
     MAX_FUSION_CANDIDATES,
+    scope,
   );
   if (lexicalResult.status === 'source_unavailable') {
     return { mode: 'lexical_degraded', result: lexicalResult };
@@ -64,10 +79,19 @@ export async function recallHybridCorpus(
     semanticError = 'semantic_index_unavailable';
   } else {
     try {
+      const digest = await scope.database(input.databasePath).digest();
+      scope.assertCurrent();
+      if (input.sourceDatabaseSha256 !== undefined && input.sourceDatabaseSha256 !== digest) throw new Error('Source digest changed');
+      scope.database(input.semanticIndexPath);
+      const profile = [input.provider.model, input.provider.revision, input.provider.dimension];
       const queryEmbedding = await input.provider.embed(cleanQuery);
+      scope.assertCurrent();
+      if (JSON.stringify(profile) !== JSON.stringify([input.provider.model, input.provider.revision, input.provider.dimension])) throw new Error('Embedding profile changed');
       semantic = queryCorpusSemanticIndex(input.semanticIndexPath, queryEmbedding, {
         expectedCollectionId: input.collectionId,
-        expectedSourceDatabaseSha256: input.sourceDatabaseSha256,
+        expectedSourceDatabaseSha256: digest,
+        expectedModel: profile[0] as string,
+        expectedModelRevision: profile[1] as string,
         limit: MAX_FUSION_CANDIDATES,
       });
     } catch {
@@ -75,6 +99,8 @@ export async function recallHybridCorpus(
       semanticError = 'semantic_index_invalid';
     }
   }
+
+  if (!scope.current()) return { mode: 'lexical_degraded', semanticError: 'source_changed', result: invalidateCorpusEvidence(lexicalResult) };
 
   const fused = fuseHybridCandidates({
     query: cleanQuery,
@@ -129,7 +155,8 @@ export async function recallHybridCorpus(
         evidence,
       };
 
-  return { mode, ...(semanticError ? { semanticError } : {}), result };
+  return scope.current() ? { mode, ...(semanticError ? { semanticError } : {}), result }
+    : { mode: 'lexical_degraded', semanticError: 'source_changed', result: invalidateCorpusEvidence(result) };
 }
 
 function candidateFromEvidence(item: FederatedEvidence): HybridCandidate {

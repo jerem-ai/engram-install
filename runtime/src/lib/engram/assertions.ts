@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 import { MissingTemporalProvenanceError, normalizeTemporalInstant } from './temporal.js';
 import { isStale } from '../memory-currency.js';
+import { conflictingPairs, isLegacyMemorySource } from './contradiction-slots.js';
+import { retiredSources } from './source-retirement.js';
 
 /**
  * Engram Assertions: structured temporal facts derived from vault sources.
@@ -173,10 +175,11 @@ export function insertAssertion(
     source_node_id?: string | null;
     episode_id?: string | null;
     superseded_by?: string | null;
-  }
+  },
+  writeTimestamp?: string,
 ): EngramAssertion {
   const id = assertionId(assertion);
-  const now = new Date().toISOString();
+  const now = writeTimestamp === undefined ? new Date().toISOString() : normalizeTemporalInstant(writeTimestamp);
   if (assertion.valid_from === undefined || assertion.valid_from === null) {
     throw new MissingTemporalProvenanceError();
   }
@@ -414,41 +417,41 @@ export function countAssertions(db: Database.Database): number {
 export function detectContradictions(
   db: Database.Database,
   sourceAllowed: (sourceNodeId: string) => boolean = () => true,
+  options: { maxNew?: number } = {},
 ): EngramContradictionCase[] {
-  // Find pairs of current assertions with same subject+predicate but different objects
-  const pairs = db.prepare(`
-    SELECT a.id as aid, a.subject, a.predicate, a.object as a_object,
-           a.source_node_id as a_source, b.id as bid, b.object as b_object,
-           b.source_node_id as b_source
-    FROM engram_assertions a
-    JOIN engram_assertions b
-      ON a.subject = b.subject
-     AND a.predicate = b.predicate
-     AND a.id < b.id
-     AND a.status = 'current'
-     AND b.status = 'current'
-    WHERE a.object != b.object
-      AND a.owner_principal_id = current_principal_id()
-      AND b.owner_principal_id = current_principal_id()
-      AND (a.valid_to IS NULL OR a.valid_to > datetime('now'))
-      AND (b.valid_to IS NULL OR b.valid_to > datetime('now'))
-  `).all() as Array<{
-    aid: string; subject: string; predicate: string;
-    a_object: string; a_source: string; bid: string; b_object: string; b_source: string;
-  }>;
+  const maxNew = options.maxNew ?? Number.POSITIVE_INFINITY;
+  // Candidate rows: current, unexpired assertions owned by this principal.
+  // conflictingPairs() keeps only single-value slots with differing values.
+  const lapsed = sideLapseCheck(db);
+  const rows = (db.prepare(`
+    SELECT id, subject, predicate, object, source_node_id, status, valid_to, superseded_by
+    FROM engram_assertions
+    WHERE status = 'current'
+      AND owner_principal_id = current_principal_id()
+      AND (valid_to IS NULL OR valid_to > datetime('now'))
+  `).all() as Array<LapseRow & { subject: string; predicate: string; object: string; source_node_id: string }>)
+    // A fact from a retired or stale note is not served as current, so it cannot conflict.
+    .filter(row => lapsed(row) === null);
+  const pairs = conflictingPairs(rows).map(([a, b]) => ({
+    aid: a.id, subject: a.subject, predicate: a.predicate, a_object: a.object, a_source: a.source_node_id,
+    bid: b.id, b_object: b.object, b_source: b.source_node_id,
+  }));
 
   const cases: EngramContradictionCase[] = [];
   const now = new Date().toISOString();
 
   for (const pair of pairs) {
+    if (cases.length >= maxNew) break;
+    if (isLegacyMemorySource(pair.a_source) || isLegacyMemorySource(pair.b_source)) continue;
     if (!sourceAllowed(pair.a_source) || !sourceAllowed(pair.b_source)) continue;
-    // Check if case already exists for this pair
+    // One case per pair. A resolved or dismissed case stays decided; only a case
+    // closed because a side lapsed may reopen, when that side is current again.
     const existing = db.prepare(`
       SELECT id FROM engram_contradiction_cases
       WHERE ((assertion_a_id = ? AND assertion_b_id = ?)
           OR (assertion_a_id = ? AND assertion_b_id = ?))
         AND owner_principal_id = current_principal_id()
-        AND status = 'open'
+        AND (status = 'open' OR resolution_type IS NOT '${SIDE_LAPSED}')
     `).get(pair.aid, pair.bid, pair.bid, pair.aid);
 
     if (existing) continue; // Already detected, don't duplicate
@@ -479,6 +482,75 @@ export function detectContradictions(
   }
 
   return cases;
+}
+
+/** resolution_type for a case closed because one side stopped being current. */
+export const SIDE_LAPSED = 'side_lapsed';
+
+interface LapseRow { id: string; status: string; valid_to: string | null; superseded_by: string | null; source_node_id: string | null }
+
+/**
+ * Returns a check that says why an assertion no longer stands as current, or
+ * null when it still does. The same rules recall applies: a non-current status,
+ * an expired valid_to, a superseded_by mark, a retired source note
+ * (source-retirement.ts), or a source whose frontmatter marks it stale.
+ */
+function sideLapseCheck(db: Database.Database): (row: LapseRow | undefined) => string | null {
+  const retired = retiredSources(db);
+  const now = Date.now();
+  const sourceFrontmatter = db.prepare('SELECT frontmatter FROM nodes WHERE id = ?');
+  const staleSource = new Map<string, boolean>();
+  return (row) => {
+    if (!row) return 'assertion missing';
+    if (row.status !== 'current') return `status ${row.status}`;
+    if (isStale({ valid_to: row.valid_to, superseded_by: row.superseded_by }, now)) return 'expired or superseded';
+    const source = row.source_node_id;
+    if (!source) return null;
+    if (retired.has(source)) return 'source retired';
+    if (!staleSource.has(source)) {
+      const node = sourceFrontmatter.get(source) as { frontmatter: string | null } | undefined;
+      let frontmatter: Record<string, unknown> = {};
+      try { frontmatter = JSON.parse(node?.frontmatter ?? '{}'); } catch { /* unreadable metadata is not proof of staleness */ }
+      staleSource.set(source, isStale(frontmatter, now));
+    }
+    return staleSource.get(source) ? 'source marked stale' : null;
+  };
+}
+
+/**
+ * Close open cases where either side no longer stands as current, for example
+ * after an engram_remember correction retired the stale note. Cases where both
+ * sides are still current stay open for review. Returns the closed cases.
+ */
+export function closeLapsedContradictions(db: Database.Database): Array<{ id: string; evidence_note: string }> {
+  const lapsed = sideLapseCheck(db);
+  const assertion = db.prepare(`
+    SELECT id, status, valid_to, superseded_by, source_node_id FROM engram_assertions WHERE id = ?
+  `);
+  const close = db.prepare(`
+    UPDATE records_engram_contradiction_cases
+    SET status = 'resolved', resolved_at = ?, resolution_type = '${SIDE_LAPSED}', evidence_note = ?
+    WHERE tenant_id = current_tenant_id()
+      AND owner_principal_id = current_principal_id()
+      AND id = ? AND status = 'open'
+  `);
+  const open = db.prepare(`
+    SELECT id, assertion_a_id, assertion_b_id FROM engram_contradiction_cases
+    WHERE status = 'open' AND owner_principal_id = current_principal_id()
+  `).all() as Array<{ id: string; assertion_a_id: string; assertion_b_id: string }>;
+  const now = new Date().toISOString();
+  const closed: Array<{ id: string; evidence_note: string }> = [];
+  for (const c of open) {
+    const reasons = [c.assertion_a_id, c.assertion_b_id].flatMap(id => {
+      const reason = lapsed(assertion.get(id) as LapseRow | undefined);
+      return reason ? [`${id}: ${reason}`] : [];
+    });
+    if (reasons.length === 0) continue;
+    const evidence_note = `Closed automatically; a side is no longer current (${reasons.join('; ')})`;
+    close.run(now, evidence_note, c.id);
+    closed.push({ id: c.id, evidence_note });
+  }
+  return closed;
 }
 
 export function resolveContradiction(

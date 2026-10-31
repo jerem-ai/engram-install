@@ -12,6 +12,7 @@ import { isAbsolute, basename, relative, resolve, dirname, normalize as normaliz
 import matter from 'gray-matter';
 import { parseFrontmatterLoud } from './parser.js';
 import type { Store } from './store.js';
+import { requireUnboundCaptureAllowed } from './capture-policy.js';
 
 export interface CreateNodeOptions {
   title: string;
@@ -46,6 +47,7 @@ export class VaultWriter {
   ) {}
 
   createNode(opts: CreateNodeOptions): string {
+    requireUnboundCaptureAllowed();
     if (!isSafeTitle(opts.title)) {
       throw new Error(`Unsafe node title: ${opts.title}`);
     }
@@ -71,6 +73,7 @@ export class VaultWriter {
     try {
       // Index in store. If indexing fails, remove the file so callers never
       // observe a vault-only half write.
+      requireUnboundCaptureAllowed();
       this.indexFile(relPath);
     } catch (error) {
       unlinkSync(absPath);
@@ -81,6 +84,7 @@ export class VaultWriter {
   }
 
   createOrReuseNode(opts: CreateNodeOptions): DurableNodeResult {
+    requireUnboundCaptureAllowed();
     if (!isSafeTitle(opts.title)) {
       throw new Error(`Unsafe node title: ${opts.title}`);
     }
@@ -108,6 +112,7 @@ export class VaultWriter {
   }
 
   annotateNode(nodeId: string, content: string): void {
+    requireUnboundCaptureAllowed();
     this.store.assertSourceNotErased(nodeId);
     const absPath = this.safePath(nodeId, true);
 
@@ -139,6 +144,7 @@ export class VaultWriter {
     nodeId: string,
     assertion: AssertionSourceFrontmatter,
   ): AssertionSourceResult {
+    requireUnboundCaptureAllowed();
     return this.upsertAssertionInNode(nodeId, assertion);
   }
 
@@ -147,6 +153,7 @@ export class VaultWriter {
     directory: string,
     assertion: AssertionSourceFrontmatter,
   ): AssertionSourceResult {
+    requireUnboundCaptureAllowed();
     const nodeId = `${directory}/${title}.md`;
     if (!this.isInsideVault(nodeId)) {
       throw new Error(`Unsafe vault path: ${nodeId}`);
@@ -198,6 +205,7 @@ export class VaultWriter {
   }
 
   addLink(sourceId: string, targetRef: string, context: string): void {
+    requireUnboundCaptureAllowed();
     this.store.assertSourceNotErased(sourceId);
     const targetId = targetRef.endsWith('.md') ? targetRef : targetRef + '.md';
     this.store.assertSourceNotErased(targetId);

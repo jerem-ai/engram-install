@@ -13,8 +13,11 @@ export function createGenericCorpusAdapter(
     classifySource: row => row.start_ms !== null
       ? 'video'
       : /^post-\d+$/.test(row.locator) ? 'forum_post' : 'document',
-    citationUrl: (row, seconds) => seconds !== null
-      ? `${row.url}${row.url.includes('?') ? '&' : '?'}t=${seconds}s`
-      : /^post-\d+$/.test(row.locator) ? `${row.url.split('#')[0]}#${row.locator}` : row.url,
+    citationUrl: (row, seconds) => {
+      if (seconds !== null) return `${row.url}${row.url.includes('?') ? '&' : '?'}t=${seconds}s`;
+      const page = row.locator.match(/^page=([1-9]\d*)(?:;|$)/);
+      if (page && Number.isSafeInteger(Number(page[1]))) return `${row.url.split('#')[0]}#page=${page[1]}`;
+      return /^post-\d+$/.test(row.locator) ? `${row.url.split('#')[0]}#${row.locator}` : row.url;
+    },
   };
 }

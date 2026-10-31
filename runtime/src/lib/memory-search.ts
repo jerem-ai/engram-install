@@ -1,12 +1,15 @@
 import type { Store } from './store.js';
 import type { Embedder } from './embedder.js';
 import type { SearchResult } from './types.js';
+import { PerformanceTrace, timed, timedAsync, type PerformanceReport } from './performance-trace.js';
 import { admittedSourceSql, getMemorySourceAdmission, memorySourceGate, type MemoryAdmissionMode } from './engram/admission.js';
 import { memoryEvidence } from './memory-evidence.js';
 import { isStale, memoryAge } from './memory-currency.js';
 import { retiredSources } from './engram/source-retirement.js';
 import { mergePassageCandidates, passageVectorsFor, resolvePassageOpts } from './passage-rescore.js';
 import { answerScorer, answerVerifyEnabled, type AnswerScorer } from './answer-verify.js';
+import { memoryReadVersion, retainCurrentRead } from './read-consistency.js';
+import { searchEligibleMemoryVectors } from './filtered-memory-vector.js';
 export { isStale, memoryAge } from './memory-currency.js';
 
 const RRF_K = 60;
@@ -135,6 +138,8 @@ export interface DiversityOpts {
 }
 
 export interface MemorySearchOpts {
+  /** Opt-in body-free elapsed spans; observer failures cannot affect retrieval. */
+  performance?: (report: PerformanceReport) => void;
   /** Number of results to return (default 10). */
   k?: number;
   /** Filter by persona frontmatter field. */
@@ -149,6 +154,8 @@ export interface MemorySearchOpts {
   diversity?: DiversityOpts;
   /** Which memory sources may be returned (see MemoryAdmissionMode). */
   admission?: MemoryAdmissionMode;
+  /** Offline G3 comparison only. Production keeps the exact scan. */
+  vectorSearch?: 'exact' | 'filtered';
   /** Offline evaluation only: receives each list's order and the fused ranking. */
   trace?: (trace: FusionTrace) => void;
   /** Fusion overrides for offline evaluation; production uses the defaults. */
@@ -188,6 +195,13 @@ export interface FusionOpts {
    * full-text vote. -Infinity turns it off.
    */
   demoteMaxLogit: number;
+  /**
+   * Leave requests addressed to the agent (isAgentRequest) out of demotion,
+   * as answerSkipRequests does for the no-answer filter: they ask for work,
+   * so a passage that "does not answer" them may still be the memory they
+   * need. Verification still runs on them.
+   */
+  demoteSkipRequests: boolean;
   /**
    * Final rerank (question-shaped queries when verifyQuestionsOnly is set):
    * candidates are gathered as if the caller had asked for rerankPoolK results,
@@ -246,7 +260,7 @@ export interface FusionOpts {
  */
 export const FUSION_DEFAULTS: FusionOpts = {
   anchorFtsRank: 0, anchorMinCosine: 1,
-  verifyFtsRank: 3, verifyMinLogit: 2, verifyQuestionsOnly: true, demoteMaxLogit: -5,
+  verifyFtsRank: 3, verifyMinLogit: 2, verifyQuestionsOnly: true, demoteMaxLogit: -5, demoteSkipRequests: false,
   rerankDepth: 0, rerankPoolK: 20, rerankFloor: 0.024, rerankDropBelow: -Infinity,
   eligibleArms: false, ftsMaxDf: 1, answerMinLogit: -8, answerSkipRequests: false,
   answerQueryMinLogit: -Infinity,
@@ -430,6 +444,27 @@ export async function searchMemoryHybrid(
   query: string,
   opts: MemorySearchOpts = {},
 ): Promise<SearchResult[]> {
+  const trace = opts.performance ? new PerformanceTrace(opts.performance) : undefined;
+  try {
+    const version = timed(trace, 'eligibility', () => memoryReadVersion(store));
+    const results = await searchMemoryHybridMeasured(store, embedder, query, opts, () => memoryReadVersion(store) === version, trace);
+    const current = timed(trace, 'eligibility', () => retainCurrentRead(store, version, results));
+    trace?.finish('ok');
+    // The observer can synchronously change state; the final return
+    // applies the same postcondition after instrumentation has completed.
+    return retainCurrentRead(store, version, current);
+  } catch (error) {
+    trace?.finish('error');
+    throw error;
+  }
+}
+
+async function searchMemoryHybridMeasured(
+  store: Store, embedder: Embedder, query: string, opts: MemorySearchOpts,
+  current: () => boolean,
+  trace?: PerformanceTrace,
+): Promise<SearchResult[]> {
+  const endEligibility = trace?.start('eligibility');
   const k = opts.k ?? 10;
   const minScore = opts.minScore ?? 0;
   const provFilter = { persona: opts.persona, runtime: opts.runtime, model: opts.model };
@@ -449,14 +484,21 @@ export async function searchMemoryHybrid(
   const eligible = (r: SearchResult) => includeStale || (!isStale(r.frontmatter) && !retired.has(r.nodeId));
   const overfetch = fusion.eligibleArms && !includeStale ? 2 : 1;
 
-  // Embed query and run both retrieval paths concurrently.
-  const embedding = await embedder.embed(query);
+  endEligibility?.();
+
+  // The current path awaits embedding before either retrieval arm.
+  const embedding = await timedAsync(trace, 'embedding', () => embedder.embed(query));
+  if (!current()) return [];
 
   // Vector: searchMemory already filters to Memory/ nodes.
-  const vecResults = store.searchMemory(embedding, gate ? store.countNodes() : poolK * 4 * overfetch)
+  const vecResults = timed(trace, 'vector', () => (opts.vectorSearch === 'filtered'
+    ? searchEligibleMemoryVectors(store, embedding, poolK * 4, {
+      admission: opts.admission, excludeStale: fusion.eligibleArms && !includeStale,
+    }).results
+    : store.searchMemory(embedding, gate ? store.countNodes() : poolK * 4 * overfetch))
     .filter(result => !gate || gate(result.nodeId))
     .filter(result => !fusion.eligibleArms || eligible(result))
-    .slice(0, poolK * 4);
+    .slice(0, poolK * 4));
 
   // FTS: query FTS5 directly on store.db, pre-filtering to Memory/ nodes.
   // We bypass store.searchFullText because:
@@ -465,6 +507,7 @@ export async function searchMemoryHybrid(
   //      even when they're the best match within Memory/.
   // Strategy: sanitize query → OR of meaningful (non-stopword) tokens, then query
   // FTS with a JOIN filter on id LIKE 'Memory/%', falling back to empty on any error.
+  const endLexical = trace?.start('lexical');
   let terms = ftsTerms(query);
   if (fusion.ftsMaxDf < 1 && terms.length > 1) {
     const share = new Map(terms.map(t => [t, memoryTermShare(store, t)]));
@@ -502,9 +545,12 @@ export async function searchMemoryHybrid(
         .filter(result => !fusion.eligibleArms || eligible(result))
         .slice(0, 40);
     } catch {
+      endLexical?.('error');
       // FTS5 syntax error on edge-case queries — vector-only is still valid
     }
   }
+
+  endLexical?.();
 
   // Passage rescoring: full-text candidates whose best passage matches the
   // query join the vector arm (see passage-rescore.ts). Same for every caller.
@@ -516,14 +562,17 @@ export async function searchMemoryHybrid(
     const rows = store.db.prepare(
       `SELECT id, title, content FROM nodes WHERE id IN (${ids.map(() => '?').join(',')})`,
     ).all(...ids) as Array<{ id: string; title: string | null; content: string | null }>;
-    best = await passageVectorsFor(embedder).best(
+    best = await timedAsync(trace, 'passages', () => passageVectorsFor(embedder, store).best(
       embedding,
       rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })),
-    );
+      current,
+    ));
+    if (!current()) return [];
     vecArm = mergePassageCandidates(vecResults, ftsResults, best, passageOpts.minCosine, poolK * 4);
   }
 
   // Build an index of all results by nodeId for score bookkeeping.
+  const endFusion = trace?.start('fusion');
   const byId = new Map<string, { nodeId: string; rrf: number; result: SearchResult }>();
 
   const fuse = (results: SearchResult[]) => {
@@ -562,6 +611,7 @@ export async function searchMemoryHybrid(
     }
   }
 
+  endFusion?.();
   const verified: Array<[string, number]> = [];
   const demoted: string[] = [];
   // Every logit this search computed, so the no-answer filter reads each note once.
@@ -573,18 +623,20 @@ export async function searchMemoryHybrid(
     ).all(...ids) as Array<{ id: string; title: string | null; content: string | null }>;
     let logits = new Map<string, number>();
     try {
-      logits = await (opts.answerScorer ?? answerScorer()).best(
-        query, rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })));
+      logits = await timedAsync(trace, 'verification', () => (opts.answerScorer ?? answerScorer()).best(
+        query, rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })), current));
     } catch (error) {
       // No verifier (model missing offline, load failure): search falls back to two lists.
       warnVerifyUnavailable(error);
     }
+    if (!current()) return [];
     for (const [id, logit] of logits) known.set(id, logit);
+    const demote = !(fusion.demoteSkipRequests && isAgentRequest(query));
     for (const [ftsRank, id] of ids.entries()) {
       const logit = logits.get(id);
       if (logit === undefined) continue;
       if (logit >= fusion.verifyMinLogit) verified.push([id, logit]);
-      if (logit < fusion.demoteMaxLogit) {
+      if (demote && logit < fusion.demoteMaxLogit) {
         byId.get(id)!.rrf -= 1.0 / (RRF_K + ftsRank + 1);
         demoted.push(id);
       }
@@ -621,11 +673,12 @@ export async function searchMemoryHybrid(
       ).all(...ids) as Array<{ id: string; title: string | null; content: string | null }>;
       let logits: Map<string, number> | undefined;
       try {
-        logits = await (opts.answerScorer ?? answerScorer()).best(
-          query, rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })));
+        logits = await timedAsync(trace, 'reranking', () => (opts.answerScorer ?? answerScorer()).best(
+          query, rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })), current));
       } catch (error) {
         warnVerifyUnavailable(error);
       }
+      if (!current()) return [];
       if (logits) {
         const scored = head.map(e => ({ e, logit: logits!.get(e.nodeId) ?? -Infinity }));
         const kept = scored.filter(x => x.logit >= fusion.rerankDropBelow).sort((a, b) => b.logit - a.logit);
@@ -641,9 +694,9 @@ export async function searchMemoryHybrid(
   // Runs AFTER minScore + provenance filtering, BEFORE .slice(0, k).
   // When disabled, falls through to a plain slice — byte-identical to pre-change behaviour.
   const divOpts = resolveDiversityOpts(opts.diversity);
-  let candidates = divOpts.enabled
+  let candidates = timed(trace, 'selection', () => divOpts.enabled
     ? greedyDiverseSelect(filtered, k, store, divOpts)
-    : filtered.slice(0, k);
+    : filtered.slice(0, k));
 
   // No-answer filters: drop returned results the answer model reads as clear
   // non-answers (answerMinLogit), or all of them when no head result answers
@@ -662,13 +715,14 @@ export async function searchMemoryHybrid(
         `SELECT id, title, content FROM nodes WHERE id IN (${missing.map(() => '?').join(',')})`,
       ).all(...missing) as Array<{ id: string; title: string | null; content: string | null }>;
       try {
-        const logits = await (opts.answerScorer ?? answerScorer()).best(
-          query, rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })));
+        const logits = await timedAsync(trace, 'verification', () => (opts.answerScorer ?? answerScorer()).best(
+          query, rows.map(r => ({ id: r.id, title: r.title ?? '', content: r.content ?? '' })), current));
         for (const [id, logit] of logits) known.set(id, logit);
       } catch (error) {
         warnVerifyUnavailable(error);
         ok = false;
       }
+      if (!current()) return [];
     }
     const head = candidates.slice(0, ANSWER_HEAD).map(e => known.get(e.nodeId)).filter((l): l is number => l !== undefined);
     if (ok && perQuery && head.length > 0 && Math.max(...head) < fusion.answerQueryMinLogit) {
@@ -697,7 +751,7 @@ export async function searchMemoryHybrid(
     unanswered,
   });
 
-  return candidates.map(e => {
+  return timed(trace, 'evidence', () => candidates.map(e => {
     const admission = getMemorySourceAdmission(store.db, e.nodeId);
     return {
       ...e.result,
@@ -711,5 +765,5 @@ export async function searchMemoryHybrid(
         authority: admission.authority,
       } : undefined,
     };
-  });
+  }));
 }

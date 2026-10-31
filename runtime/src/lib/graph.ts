@@ -47,13 +47,18 @@ interface NeighborInfo {
 export class KnowledgeGraph {
   private graph: Graph;
   private store: Store;
+  private policyFingerprint: string;
+  private includeNode: (nodeId: string) => boolean;
 
-  private constructor(graph: Graph, store: Store) {
+  private constructor(graph: Graph, store: Store, includeNode: (nodeId: string) => boolean, fingerprint: string) {
     this.graph = graph;
     this.store = store;
+    this.includeNode = includeNode;
+    this.policyFingerprint = fingerprint;
   }
 
   static fromStore(store: Store, includeNode: (nodeId: string) => boolean = () => true): KnowledgeGraph {
+    const fingerprint = store.capturePolicySnapshot().fingerprint;
     const graph = new Graph({ multi: true, type: 'directed' });
     for (const id of store.allNodeIds().filter(includeNode)) {
       const node = store.getNode(id);
@@ -69,18 +74,36 @@ export class KnowledgeGraph {
         }
       }
     }
-    return new KnowledgeGraph(graph, store);
+    return new KnowledgeGraph(graph, store, includeNode, fingerprint);
+  }
+
+  /** Rebuild derived titles/topology when current source eligibility changes. */
+  private refreshPolicy(): void {
+    const fingerprint = this.store.capturePolicySnapshot().fingerprint;
+    if (fingerprint === this.policyFingerprint) return;
+    const rebuilt = KnowledgeGraph.fromStore(this.store, this.includeNode);
+    // A changing file must never make a partial rebuild the active cache.
+    if (this.store.capturePolicySnapshot().fingerprint !== fingerprint) {
+      this.graph = new Graph({ multi: true, type: 'directed' });
+      this.policyFingerprint = '';
+      return;
+    }
+    this.graph = rebuilt.graph;
+    this.policyFingerprint = fingerprint;
   }
 
   nodeCount(): number {
+    this.refreshPolicy();
     return this.graph.order;
   }
 
   edgeCount(): number {
+    this.refreshPolicy();
     return this.graph.size;
   }
 
   neighbors(nodeId: string, depth: number, relationType?: string): NeighborInfo[] {
+    this.refreshPolicy();
     if (!this.graph.hasNode(nodeId)) return [];
     const visited = new Set<string>();
     const result: NeighborInfo[] = [];
@@ -126,6 +149,7 @@ export class KnowledgeGraph {
   }
 
   findPaths(fromId: string, toId: string, maxDepth: number, relationType?: string): PathResult[] {
+    this.refreshPolicy();
     if (!this.graph.hasNode(fromId) || !this.graph.hasNode(toId)) return [];
     const undirected = this.toUndirected();
     const rawPaths = findAllSimplePaths(undirected, fromId, toId, maxDepth);
@@ -158,6 +182,7 @@ export class KnowledgeGraph {
   }
 
   commonNeighbors(nodeA: string, nodeB: string): Array<{ id: string; title: string }> {
+    this.refreshPolicy();
     if (!this.graph.hasNode(nodeA) || !this.graph.hasNode(nodeB)) return [];
     const neighborsA = new Set([
       ...this.graph.outNeighbors(nodeA),
@@ -177,6 +202,8 @@ export class KnowledgeGraph {
   }
 
   subgraph(nodeId: string, depth: number): SubgraphResult {
+    this.refreshPolicy();
+    if (!this.graph.hasNode(nodeId)) return { nodes: [], edges: [] };
     const visited = new Set<string>();
     const queue: Array<{ id: string; d: number }> = [{ id: nodeId, d: 0 }];
     visited.add(nodeId);
@@ -220,6 +247,7 @@ export class KnowledgeGraph {
   }
 
   detectCommunities(resolution = 1.0): Community[] {
+    this.refreshPolicy();
     const undirected = this.toUndirected();
     const assignments = louvain(undirected, { resolution });
     const communityMap = new Map<number, string[]>();
@@ -262,6 +290,7 @@ export class KnowledgeGraph {
   }
 
   bridges(limit: number): Array<{ id: string; title: string; score: number }> {
+    this.refreshPolicy();
     const undirected = this.toUndirected();
     const bc = betweennessCentrality(undirected);
     return Object.entries(bc)
@@ -278,6 +307,7 @@ export class KnowledgeGraph {
     limit: number,
     communityNodeIds?: string[],
   ): Array<{ id: string; title: string; score: number }> {
+    this.refreshPolicy();
     const undirected = this.toUndirected();
     const pr = safeRank(undirected);
     let entries = Object.entries(pr);

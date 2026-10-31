@@ -1,6 +1,10 @@
+import { fileRevisionCurrent, SourceFileChangedError, type FileReadRevision } from './file-snapshot.js';
+import { captureArtifactAllowed, capturePathAllowed, readCapturePolicy, type CapturePolicySnapshot } from './capture-policy.js';
 import Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 import * as sqliteVec from 'sqlite-vec';
 import type { ParsedNode, ParsedEdge, SearchResult } from './types.js';
+import { installCapturePolicyViews } from './capture-policy-db.js';
 import { ensureEpisodesTable } from './engram/episodes.js';
 import { ensureAssertionTables } from './engram/assertions.js';
 import { ensureMemoryAdmissionTables } from './engram/admission.js';
@@ -45,6 +49,10 @@ export class ErasedSourceError extends Error {
 }
 
 export interface StoreOptions {
+  /** Private replay embedding only. Evaluated on each read; errors deny. */
+  recordVisible?: (sourceNodeId: string) => boolean;
+  /** Trusted embedding/fixture configuration only; never an MCP argument. */
+  capturePolicyFile?: string;
   /**
    * Open the database read-only. Skips the WAL pragma, schema creation and
    * migrations, so the file on disk is never touched. The tenant binding and
@@ -58,10 +66,25 @@ export class Store {
   db: Database.Database;
   readonly accessContext: AccessContext;
   readonly readonly: boolean;
+  private readonly capturePolicyFile?: string;
+
+  capturePolicySnapshot(): CapturePolicySnapshot {
+    return readCapturePolicy(this.capturePolicyFile);
+  }
+
+  capturePathAllowed(sourcePath: string): boolean {
+    return capturePathAllowed(this.capturePolicySnapshot(), sourcePath);
+  }
+
+  captureNodeAllowed(frontmatter: unknown, sourcePath?: string): boolean {
+    return captureArtifactAllowed(this.capturePolicySnapshot(), frontmatter)
+      && (sourcePath === undefined || this.capturePathAllowed(sourcePath));
+  }
 
   constructor(dbPath: string, accessContext: AccessContext, options: StoreOptions = {}) {
     this.accessContext = validateAccessContext(accessContext);
     this.readonly = options.readonly === true;
+    this.capturePolicyFile = options.capturePolicyFile;
     this.db = this.readonly
       ? new Database(dbPath, { readonly: true, fileMustExist: true })
       : new Database(dbPath);
@@ -79,6 +102,7 @@ export class Store {
         this.createSchema();
         this.runMigrations();
       }
+      installCapturePolicyViews(this.db, options.capturePolicyFile, options.recordVisible);
     } catch (error) {
       if (this.db.open) this.db.close();
       throw error;
@@ -397,6 +421,9 @@ export class Store {
   }
 
   upsertNode(node: ParsedNode): void {
+    if (!this.captureNodeAllowed(node.frontmatter, node.id.startsWith('/') ? node.id : undefined)) {
+      throw new Error('capture blocked: source_excluded');
+    }
     this.assertSourceNotErased(node.id);
     // FTS5 content-sync tables require manual delete-before-reinsert.
     // We must fetch the ACTUAL old values for the FTS5 delete command.
@@ -458,7 +485,7 @@ export class Store {
     );
 
     const row = this.db.prepare(
-      'SELECT rowid FROM nodes WHERE id = ?'
+      'SELECT rowid FROM main.nodes WHERE id = ?'
     ).get(node.id) as { rowid: number };
 
     this.db.prepare(
@@ -758,13 +785,24 @@ export class Store {
   }
 
   upsertEmbedding(nodeId: string, embedding: Float32Array): void {
+    this.db.transaction(() => {
+      const policy = readCapturePolicy().fingerprint;
+      this.writeEmbedding(nodeId, embedding);
+      if (readCapturePolicy().fingerprint !== policy) throw new Error('capture blocked: policy_changed');
+    }).immediate();
+  }
+
+  private writeEmbedding(nodeId: string, embedding: Float32Array): void {
     this.assertSourceNotErased(nodeId);
     const node = this.db.prepare(`
-      SELECT rowid FROM records_nodes
+      SELECT rowid, frontmatter FROM records_nodes
       WHERE tenant_id = current_tenant_id()
         AND owner_principal_id = current_principal_id()
         AND id = ?
-    `).get(nodeId) as { rowid: number } | undefined;
+    `).get(nodeId) as { rowid: number; frontmatter: string } | undefined;
+    if (node && !this.captureNodeAllowed(parseFrontmatter(node.frontmatter), nodeId.startsWith('/') ? nodeId : undefined)) {
+      throw new Error('capture blocked: source_excluded');
+    }
     if (!node) {
       if (this.db.prepare(`
         SELECT 1 FROM records_nodes
@@ -776,7 +814,74 @@ export class Store {
     this.db.prepare('DELETE FROM nodes_vec WHERE rowid = ?').run(BigInt(node.rowid));
     this.db.prepare(
       'INSERT INTO nodes_vec(rowid, embedding) VALUES (?, ?)'
-    ).run(BigInt(node.rowid), Buffer.from(embedding.buffer));
+    ).run(BigInt(node.rowid), Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength));
+  }
+
+  /** Optimistic data version only; it grants no access or write authority. */
+  snapshotIndexNode(node: ParsedNode, sourcePath?: string): string | undefined {
+    if (this.isSourceErased(node.id) || !this.captureNodeAllowed(node.frontmatter, sourcePath)) return;
+    const row = this.indexNodeRow(node.id);
+    if (!row || row.title !== node.title || row.content !== node.content
+      || row.frontmatter !== JSON.stringify(node.frontmatter) || row.source !== (node.source ?? 'vault')) return;
+    return this.indexNodeVersion(node.id, row);
+  }
+
+  /** Publish the vector, optional vault edges and watermark for exactly one node version. */
+  commitIndexedEmbedding(nodeId: string, embedding: Float32Array, options: {
+    expectedVersion: string; mtime: number; sourcePath: string; edges?: ParsedEdge[];
+    sourceRevision?: FileReadRevision;
+  }): { committed: boolean; edgesIndexed: number } {
+    const publish = this.db.transaction(() => {
+      const policy = readCapturePolicy().fingerprint;
+      const skipped = { committed: false, edgesIndexed: 0 };
+      if (options.sourceRevision && (options.mtime !== options.sourceRevision.mtime
+        || !fileRevisionCurrent(options.sourcePath, options.sourceRevision))) return skipped;
+      if (!this.capturePathAllowed(options.sourcePath)) return skipped;
+      const row = this.indexNodeRow(nodeId);
+      if (!row || this.isSourceErased(nodeId) || this.indexNodeVersion(nodeId, row) !== options.expectedVersion
+        || (this.getSyncMtime(nodeId) ?? -Infinity) > options.mtime) return skipped;
+      if (!this.captureNodeAllowed(parseFrontmatter(row.frontmatter), options.sourcePath)) {
+        throw new Error('capture blocked: source_excluded');
+      }
+      this.writeEmbedding(nodeId, embedding);
+      let edgesIndexed = 0;
+      if (options.edges !== undefined) {
+        this.deleteAllEdgesFrom(nodeId);
+        for (const edge of options.edges) {
+          if (edge.sourceId !== nodeId) throw new Error('index edge source mismatch');
+          if (this.isSourceErased(edge.sourceId) || this.isSourceErased(edge.targetId)) continue;
+          this.insertEdge(edge);edgesIndexed++;
+        }
+      }
+      this.upsertSync(nodeId, options.mtime);
+      if (!this.captureNodeAllowed(parseFrontmatter(row.frontmatter), options.sourcePath)) {
+        throw new Error('capture blocked: source_excluded');
+      }
+      if (readCapturePolicy().fingerprint !== policy) throw new Error('capture blocked: policy_changed');
+      if (options.sourceRevision && !fileRevisionCurrent(options.sourcePath, options.sourceRevision)) throw new SourceFileChangedError();
+      return { committed: true, edgesIndexed };
+    });
+    try { return publish.immediate(); }
+    catch (error) {
+      if (error instanceof SourceFileChangedError) return { committed: false, edgesIndexed: 0 };
+      throw error;
+    }
+  }
+
+  private indexNodeRow(nodeId: string): {
+    rowid: bigint; title: string; content: string; frontmatter: string; source: string;
+  } | undefined {
+    return this.db.prepare(`SELECT rowid, title, content, frontmatter, source FROM nodes WHERE id = ?`)
+      .safeIntegers(true).get(nodeId) as ReturnType<Store['indexNodeRow']>;
+  }
+
+  private indexNodeVersion(nodeId: string, row: NonNullable<ReturnType<Store['indexNodeRow']>>): string {
+    const digest = createHash('sha256');
+    for (const value of [this.accessContext.tenantId, this.accessContext.principalId, nodeId,
+      String(row.rowid), row.title, row.content, row.frontmatter, row.source]) {
+      digest.update(String(Buffer.byteLength(value)) + ':');digest.update(value);
+    }
+    return digest.digest('hex');
   }
 
   searchVector(embedding: Float32Array, limit = 20): SearchResult[] {
@@ -831,18 +936,9 @@ export class Store {
       WHERE n.source = 'vault' AND n.id LIKE 'Memory/%'
       ORDER BY distance
       LIMIT ?
-    `).all(Buffer.from(embedding.buffer), limit) as any[];
+    `).all(Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength), limit) as any[];
 
-    return candidates
-      .map(r => ({
-        nodeId: r.id,
-        title: r.title,
-        score: 1 - r.distance,
-        // Embeddings are unit vectors: squared L2 distance = 2 - 2*cosine.
-        cosine: Math.max(-1, Math.min(1, 1 - r.distance * r.distance / 2)),
-        excerpt: firstParagraph(r.content ?? '', 200),
-        frontmatter: parseFrontmatter(r.frontmatter),
-      }));
+    return candidates.map(memoryVectorResult);
   }
 
   upsertSync(path: string, mtime: number): void {
@@ -947,6 +1043,21 @@ export function ftsText(
     return base + '\n' + (aliases as string[]).join(' ');
   }
   return base;
+}
+
+/** Keep exact and filtered vector paths on the same score and payload contract. */
+export function memoryVectorResult(row: {
+  id: string; title: string; distance: number; content: string | null; frontmatter: string | null;
+}): SearchResult {
+  return {
+    nodeId: row.id,
+    title: row.title,
+    score: 1 - row.distance,
+    // Embeddings are unit vectors: squared L2 distance = 2 - 2*cosine.
+    cosine: Math.max(-1, Math.min(1, 1 - row.distance * row.distance / 2)),
+    excerpt: firstParagraph(row.content ?? '', 200),
+    frontmatter: parseFrontmatter(row.frontmatter),
+  };
 }
 
 function parseFrontmatter(raw: string | null | undefined): Record<string, unknown> {

@@ -3,7 +3,6 @@ import {
   appendFileSync,
   chmodSync,
   mkdirSync,
-  readFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -11,9 +10,11 @@ import { performance } from 'node:perf_hooks';
 import {
   executeCorpusRoute,
   loadCorpusRoutingPolicy,
+  retainCurrentCorpusRoute,
   type CorpusRouteExecution,
 } from './corpus-router.js';
 import type { CorpusEmbeddingProvider } from './corpus-semantic-index.js';
+import { CorpusReadScope } from './corpus-read-consistency.js';
 
 export interface CorpusRoutingRuntimeOptions {
   registryPath: string;
@@ -76,32 +77,38 @@ export function createCorpusRoutingRuntime(
   const runtimeForceLexical = options.forceLexical ?? false;
   return {
     async route(input): Promise<CorpusRouteExecution> {
-      const started = performance.now();
-      const policy = loadCorpusRoutingPolicy(readFileSync(options.policyPath, 'utf8'));
-      const semanticIndexPaths = Object.fromEntries(policy.collections.map(collection => [
-        collection.collectionId,
-        join(options.semanticIndexDirectory, `${collection.collectionId}.sqlite3`),
-      ]));
-      const execution = await executeCorpusRoute({
-        query: input.query,
-        explicitCollectionIds: input.collectionIds,
-        autoRoutingEnabled: runtimeAutoRouting
-          && policy.defaults.autoRoutingEnabled
-          && input.autoRoutingEnabled !== false,
-        maxCollections: input.maxCollections,
-        registryPath: options.registryPath,
-        policy,
-        semanticIndexPaths,
-        provider: options.provider,
-        limit: input.limit,
-        semanticMinSimilarity: options.semanticMinSimilarity,
-        forceLexical: runtimeForceLexical || input.forceLexical === true,
-      });
-      appendReceipt(
-        options.receiptPath,
-        receiptFor(execution, performance.now() - started, options.now?.() ?? new Date()),
-      );
-      return execution;
+      const scope = new CorpusReadScope();
+      try {
+        const started = performance.now();
+        const policy = loadCorpusRoutingPolicy(scope.text(options.policyPath));
+        const semanticIndexPaths = Object.fromEntries(policy.collections.map(collection => [
+          collection.collectionId,
+          join(options.semanticIndexDirectory, `${collection.collectionId}.sqlite3`),
+        ]));
+        const execution = await executeCorpusRoute({
+          query: input.query,
+          explicitCollectionIds: input.collectionIds,
+          autoRoutingEnabled: runtimeAutoRouting
+            && policy.defaults.autoRoutingEnabled
+            && input.autoRoutingEnabled !== false,
+          maxCollections: input.maxCollections,
+          registryPath: options.registryPath,
+          policy,
+          semanticIndexPaths,
+          provider: options.provider,
+          limit: input.limit,
+          semanticMinSimilarity: options.semanticMinSimilarity,
+          forceLexical: runtimeForceLexical || input.forceLexical === true,
+          readScope: scope,
+        });
+        const now = options.now?.() ?? new Date();
+        const retained = retainCurrentCorpusRoute(scope, execution);
+        appendReceipt(
+          options.receiptPath,
+          receiptFor(retained, performance.now() - started, now),
+        );
+        return retainCurrentCorpusRoute(scope, retained);
+      } finally { scope.close(); }
     },
   };
 }

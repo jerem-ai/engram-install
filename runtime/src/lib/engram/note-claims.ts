@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { captureDecision, capturePathAllowed, readCapturePolicy } from '../capture-policy.js';
 
 /**
  * Note claims (extraction/note_claims.py, October 20, OBSERVE.md 15g). Session logs,
@@ -62,6 +63,8 @@ export function fileNoteClaims(path = noteClaimsPath()): NoteClaimsLookup {
   let stamp = '';
   let lookup: NoteClaimsLookup = () => null;
   return (nodeId) => {
+    const policy = readCapturePolicy();
+    if (!captureDecision(policy, null).allowed || !capturePathAllowed(policy, path)) return null;
     if (!existsSync(path)) return null;
     const s = statSync(path);
     const now = `${s.size}:${s.mtimeMs}`;

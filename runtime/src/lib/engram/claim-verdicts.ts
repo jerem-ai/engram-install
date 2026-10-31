@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { factLinkKey } from './provenance.js';
+import { captureDecision, capturePathAllowed, readCapturePolicy } from '../capture-policy.js';
 
 /**
  * Per-claim review verdicts (extraction/claim_review.py, October 20). The write-time
@@ -47,6 +48,11 @@ export function passagesDigest(passages: string[]): string {
 
 export type ClaimVerdictLookup = (sourceNodeId: string, claim: Triple, passages: string[]) => ClaimVerdict | null;
 
+/** A hidden review cannot be treated as the absence of a rejection. */
+export class ClaimReviewDeferred extends Error {
+  constructor() { super('claim review deferred: source_context_unknown'); }
+}
+
 /** The latest record per key; a later record replaces an earlier one. */
 export function parseClaimVerdicts(text: string): Map<string, ClaimVerdict> {
   const out = new Map<string, ClaimVerdict>();
@@ -72,11 +78,20 @@ export function lookupIn(verdicts: Map<string, ClaimVerdict>): ClaimVerdictLooku
 export function fileClaimVerdicts(path = claimVerdictsPath()): ClaimVerdictLookup {
   let stamp = '';
   let lookup: ClaimVerdictLookup = () => null;
+  const requireReadable = () => {
+    const policy = readCapturePolicy();
+    if (!captureDecision(policy, null).allowed || !capturePathAllowed(policy, path)) {
+      stamp = ''; lookup = () => null;
+      throw new ClaimReviewDeferred();
+    }
+  };
   return (sourceNodeId, claim, passages) => {
+    requireReadable();
     if (!existsSync(path)) return null;
     const s = statSync(path);
     const now = `${s.size}:${s.mtimeMs}`;
     if (now !== stamp) { lookup = lookupIn(parseClaimVerdicts(readFileSync(path, 'utf8'))); stamp = now; }
+    requireReadable();
     return lookup(sourceNodeId, claim, passages);
   };
 }

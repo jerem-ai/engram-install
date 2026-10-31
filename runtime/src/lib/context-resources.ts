@@ -1,3 +1,6 @@
+import { contextCaptureAllowed, contextCaptureBinding } from './capture-context.js';
+import { capturePathAllowed, readCapturePolicy } from './capture-policy.js';
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
@@ -33,6 +36,7 @@ export interface ContextResourceConfig {
   include?: string[];
   exclude?: string[];
   maxBytes?: number;
+  refreshStatusPath?: string;
 }
 
 export interface ContextResource extends ContextResourceConfig {
@@ -80,6 +84,7 @@ export interface ReadResult {
   bytes: number;
   truncated: boolean;
   text: string;
+  sha256: string;
 }
 
 export function resolveContextConfig(overrides: ContextConfigOverrides = {}): ContextConfig {
@@ -149,7 +154,7 @@ export function loadResources(configPath: string): ContextResource[] {
 }
 
 export function listResources(config: ContextConfig): Record<string, unknown>[] {
-  return config.resources.map(resource => ({
+  return config.resources.filter(resource => capturePathAllowed(readCapturePolicy(), resource.rootReal)).map(resource => ({
     id: resource.id,
     title: resource.title,
     description: resource.description,
@@ -174,6 +179,8 @@ export function readContextFile(config: ContextConfig, resourceId: string, opts:
   const resource = findResource(config, resourceId);
   const { absolutePath, relativePath } = resolveResourcePath(resource, opts.path);
   assertReadableFile(resource, absolutePath, relativePath);
+  const capture = contextCaptureBinding(absolutePath);
+  if (!contextCaptureAllowed(absolutePath, capture)) throw new Error('capture blocked: context_excluded');
 
   const size = statSync(absolutePath).size;
   const requestedMax = clampMaxBytes(opts.maxBytes ?? resource.maxBytes);
@@ -183,6 +190,8 @@ export function readContextFile(config: ContextConfig, resourceId: string, opts:
   }
 
   const buffer = readFileSync(absolutePath);
+  if (capture) capture.revision = createHash('sha256').update(buffer).digest('hex');
+  if (!contextCaptureAllowed(absolutePath, capture, buffer)) throw new Error('capture blocked: context_excluded');
   assertTextBuffer(relativePath, buffer);
   const slice = buffer.subarray(0, limit);
   return {
@@ -191,7 +200,19 @@ export function readContextFile(config: ContextConfig, resourceId: string, opts:
     bytes: buffer.length,
     truncated: buffer.length > slice.length,
     text: slice.toString('utf-8'),
+    sha256: createHash('sha256').update(buffer).digest('hex'),
   };
+}
+
+/** Resolve the selected directory inside the same allowlist used for file reads. */
+export function resolveContextProject(config: ContextConfig, resourceId: string, projectPath: string): string {
+  const resource = findResource(config, resourceId);
+  if (isAbsolute(projectPath) || toPosix(projectPath).split('/').some(part => part === '..')) throw new Error('Invalid project path');
+  const directory = realpathSync(join(resource.rootReal, projectPath));
+  const rel = relative(resource.rootReal, directory);
+  if (rel.startsWith('..') || isAbsolute(rel) || !statSync(directory).isDirectory()) throw new Error('Project escapes resource root');
+  if (!capturePathAllowed(readCapturePolicy(), directory)) throw new Error('capture blocked: context_excluded');
+  return directory;
 }
 
 export function searchContext(config: ContextConfig, resourceId: string, opts: SearchOptions): SearchHit[] {
@@ -201,10 +222,16 @@ export function searchContext(config: ContextConfig, resourceId: string, opts: S
 
   const limit = Math.max(1, Math.min(opts.limit ?? 20, 100));
   const hits: SearchHit[] = [];
+  const policyFingerprint = readCapturePolicy().fingerprint;
   for (const relativePath of walkResourceFiles(resource)) {
     if (opts.pathGlob && !globMatches(opts.pathGlob, relativePath)) continue;
     const { absolutePath } = resolveResourcePath(resource, relativePath);
+    let capture;
+    try { capture = contextCaptureBinding(absolutePath); } catch { continue; }
+    if (!contextCaptureAllowed(absolutePath, capture)) continue;
     const buffer = readFileSync(absolutePath);
+    if (capture) capture.revision = createHash('sha256').update(buffer).digest('hex');
+    if (!contextCaptureAllowed(absolutePath, capture, buffer)) continue;
     if (!isTextBuffer(buffer)) continue;
     const lines = buffer.toString('utf-8').split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
@@ -216,10 +243,10 @@ export function searchContext(config: ContextConfig, resourceId: string, opts: S
         line: i + 1,
         preview: lines[i].trim().slice(0, 240),
       });
-      if (hits.length >= limit) return hits;
+      if (hits.length >= limit) return readCapturePolicy().fingerprint === policyFingerprint ? hits : [];
     }
   }
-  return hits;
+  return readCapturePolicy().fingerprint === policyFingerprint ? hits : [];
 }
 
 function normalizeResource(input: unknown): ContextResource | undefined {
@@ -261,6 +288,8 @@ function normalizeResource(input: unknown): ContextResource | undefined {
     include,
     exclude: [...DEFAULT_EXCLUDE_GLOBS, ...normalizeGlobList(item.exclude, [])],
     maxBytes: clampMaxBytes(item.maxBytes ?? DEFAULT_MAX_BYTES),
+    ...(typeof item.refreshStatusPath === 'string' && isAbsolute(item.refreshStatusPath)
+      ? { refreshStatusPath: item.refreshStatusPath } : {}),
   };
 }
 

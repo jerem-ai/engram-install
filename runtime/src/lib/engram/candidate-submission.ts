@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 import type { AccessContext } from '../access-context.js';
 import type { MemoryAdmissionService, MemoryCandidate } from './admission.js';
 import type { CreateNodeOptions, DurableNodeResult } from '../writer.js';
+import { requireUnboundCaptureAllowed } from '../capture-policy.js';
 
 const CANDIDATE_SOURCE_DIR = 'EngramCandidates';
 
@@ -75,6 +76,7 @@ export function submitCodexMemoryCandidate(
   writer: CandidateSourceWriter,
   input: CodexCandidateInput,
 ): CodexCandidateSubmission {
+  requireUnboundCaptureAllowed();
   const normalized = normalizeInput(input);
   const sourceHash = candidateSourceHash(normalized);
   const sourceTitle = `candidate-${sourceHash}`;
@@ -118,6 +120,7 @@ export function submitCodexMemoryCandidate(
       if (source.sourceNodeId !== durableSourceNodeId) {
         throw new Error('Candidate source writer returned an unexpected path');
       }
+      requireUnboundCaptureAllowed();
 
       return {
         status: 'quarantined' as const,

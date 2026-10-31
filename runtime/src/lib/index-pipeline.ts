@@ -1,3 +1,4 @@
+import { readFileSnapshot, fileRevisionCurrent, SourceFileChangedError } from './file-snapshot.js';
 import { stat, readdir, readFile, access } from 'fs/promises';
 import { join, basename } from 'path';
 import { hostname } from 'os';
@@ -60,8 +61,9 @@ export class IndexPipeline {
       stubNodesCreated: 0,
     };
 
-    const { nodes, edges, stubIds, skippedPaths } = await parseVault(vaultPath, {
-      includeFile: relativePath => !this.store.isSourceErased(relativePath),
+    const { nodes, edges, stubIds, skippedPaths, sourceRevisions } = await parseVault(vaultPath, {
+      includeFile: relativePath => !this.store.isSourceErased(relativePath) && this.store.capturePathAllowed(join(vaultPath, relativePath)),
+      includeFrontmatter: (fm, relativePath) => this.store.captureNodeAllowed(fm, join(vaultPath, relativePath)),
       suppressUnresolvedLink: linkTarget => this.store.isUnresolvedLinkTargetErased(linkTarget),
     });
     stats.nodesSkipped += skippedPaths.length;
@@ -69,7 +71,7 @@ export class IndexPipeline {
 
     // Detect deleted files — only consider vault paths (relative).
     // Memory paths are absolute (start with '/') and managed by indexMemoryBase().
-    const currentPaths = new Set(nodes.map(n => n.id));
+    const currentPaths = new Set([...nodes.map(n => n.id), ...skippedPaths.filter(id => !this.store.isSourceErased(id))]);
     for (const oldPath of previousPaths) {
       if (!oldPath.startsWith('/') && !currentPaths.has(oldPath)) {
         this.store.deleteNode(oldPath);
@@ -83,8 +85,13 @@ export class IndexPipeline {
         stats.nodesSkipped++;
         continue;
       }
-      const fileStat = await stat(join(vaultPath, node.id));
-      const mtime = fileStat.mtimeMs;
+      if (!this.store.captureNodeAllowed(node.frontmatter, join(vaultPath, node.id))) {
+        stats.nodesSkipped++;
+        continue;
+      }
+      const sourceRevision = sourceRevisions.get(node.id);
+      if (!sourceRevision) { stats.nodesSkipped++; continue; }
+      const mtime = sourceRevision.mtime;
       const prevMtime = this.store.getSyncMtime(node.id);
 
       if (prevMtime !== undefined && prevMtime >= mtime) {
@@ -92,7 +99,10 @@ export class IndexPipeline {
         continue;
       }
 
+      if (!fileRevisionCurrent(join(vaultPath, node.id), sourceRevision)) { stats.nodesSkipped++; continue; }
       this.store.upsertNode(node);
+      const version = this.store.snapshotIndexNode(node, join(vaultPath, node.id));
+      if (!version) { stats.nodesSkipped++; continue; }
 
       // Compute and store embedding
       const tags = Array.isArray(node.frontmatter.tags) ? node.frontmatter.tags : [];
@@ -100,25 +110,21 @@ export class IndexPipeline {
         ? node.frontmatter.aliases as string[]
         : undefined;
       const text = Embedder.buildEmbeddingText(node.title, tags as string[], node.content, aliases);
+      if (!this.store.captureNodeAllowed(node.frontmatter, join(vaultPath, node.id))) { stats.nodesSkipped++; continue; }
       const embedding = await this.embedder.embed(text);
-      this.store.upsertEmbedding(node.id, embedding);
-
-      // Re-index edges from this node
-      this.store.deleteAllEdgesFrom(node.id);
-      for (const edge of edges.filter(e => e.sourceId === node.id)) {
-        if (this.store.isSourceErased(edge.sourceId) || this.store.isSourceErased(edge.targetId)) {
-          continue;
-        }
-        this.store.insertEdge(edge);
-        stats.edgesIndexed++;
-      }
-
-      this.store.upsertSync(node.id, mtime);
+      if (!this.store.captureNodeAllowed(node.frontmatter, join(vaultPath, node.id))) { stats.nodesSkipped++; continue; }
+      const published = this.store.commitIndexedEmbedding(node.id, embedding, {
+        expectedVersion: version, mtime, sourcePath: join(vaultPath, node.id), sourceRevision,
+        edges: edges.filter(e => e.sourceId === node.id),
+      });
+      if (!published.committed) { stats.nodesSkipped++; continue; }
+      stats.edgesIndexed += published.edgesIndexed;
       stats.nodesIndexed++;
     }
 
     // Create stub nodes
     for (const stubId of stubIds) {
+      if (!this.store.captureNodeAllowed({ _stub: true })) { stats.nodesSkipped++; continue; }
       if (this.store.isSourceErased(stubId)) continue;
       if (!this.store.getNode(stubId)) {
         this.store.upsertNode({
@@ -179,8 +185,12 @@ export class IndexPipeline {
           continue;
         }
 
+        if (!this.store.capturePathAllowed(filePath)) {
+          stats.memoriesSkipped++;
+          continue;
+        }
         const fileStat = await stat(filePath);
-        const mtime = fileStat.mtimeMs;
+        let mtime = fileStat.mtimeMs;
         const prevMtime = this.store.getSyncMtime(filePath);
 
         if (prevMtime !== undefined && prevMtime >= mtime) {
@@ -188,8 +198,16 @@ export class IndexPipeline {
           continue;
         }
 
-        const raw = await readFile(filePath, 'utf-8');
+        let snapshot: Awaited<ReturnType<typeof readFileSnapshot>>;
+        try { snapshot = await readFileSnapshot(filePath); }
+        catch (error) {
+          if (error instanceof SourceFileChangedError || (error as NodeJS.ErrnoException).code === 'ENOENT') { stats.memoriesSkipped++; continue; }
+          throw error;
+        }
+        const { raw, revision: sourceRevision } = snapshot;
+        mtime = sourceRevision.mtime;
         const { fm, content, warning, threw } = parseFrontmatterLoud(raw, filePath);
+        if (!this.store.captureNodeAllowed(fm, filePath)) { stats.memoriesSkipped++; continue; }
         if (warning) console.warn(`WARN: ${warning}`);
         if (threw) {
           // unparseable frontmatter — keep the historical skip (don't index),
@@ -207,15 +225,21 @@ export class IndexPipeline {
           source: 'memory' as const,
         };
 
+        if (!fileRevisionCurrent(filePath, sourceRevision)) { stats.memoriesSkipped++; continue; }
         this.store.upsertNode(node);
+        const version = this.store.snapshotIndexNode(node, filePath);
+        if (!version) { stats.memoriesSkipped++; continue; }
         const tags = Array.isArray(fm.tags) ? fm.tags as string[] : [];
         const aliases = Array.isArray(fm.aliases) && (fm.aliases as unknown[]).every(a => typeof a === 'string')
           ? fm.aliases as string[]
           : undefined;
         const embeddingText = Embedder.buildEmbeddingText(title, tags, node.content, aliases);
+        if (!this.store.captureNodeAllowed(fm, filePath)) { stats.memoriesSkipped++; continue; }
         const embedding = await this.embedder.embed(embeddingText);
-        this.store.upsertEmbedding(filePath, embedding);
-        this.store.upsertSync(filePath, mtime);
+        if (!this.store.captureNodeAllowed(fm, filePath)) { stats.memoriesSkipped++; continue; }
+        if (!this.store.commitIndexedEmbedding(filePath, embedding, { expectedVersion: version, mtime, sourcePath: filePath, sourceRevision }).committed) {
+          stats.memoriesSkipped++; continue;
+        }
         stats.memoriesIndexed++;
       }
     }
@@ -275,8 +299,12 @@ export class IndexPipeline {
           continue;
         }
 
+        if (!this.store.capturePathAllowed(filePath)) {
+          stats.docsSkipped++;
+          continue;
+        }
         const fileStat = await stat(filePath);
-        const mtime = fileStat.mtimeMs;
+        let mtime = fileStat.mtimeMs;
         const prevMtime = this.store.getSyncMtime(id);
 
         if (prevMtime !== undefined && prevMtime >= mtime) {
@@ -284,8 +312,16 @@ export class IndexPipeline {
           continue;
         }
 
-        const raw = await readFile(filePath, 'utf-8');
+        let snapshot: Awaited<ReturnType<typeof readFileSnapshot>>;
+        try { snapshot = await readFileSnapshot(filePath); }
+        catch (error) {
+          if (error instanceof SourceFileChangedError || (error as NodeJS.ErrnoException).code === 'ENOENT') { stats.docsSkipped++; continue; }
+          throw error;
+        }
+        const { raw, revision: sourceRevision } = snapshot;
+        mtime = sourceRevision.mtime;
         const { fm, content, warning, threw } = parseFrontmatterLoud(raw, filePath);
+        if (!this.store.captureNodeAllowed(fm, filePath)) { stats.docsSkipped++; continue; }
         if (warning) console.warn(`WARN: ${warning}`);
         if (threw) {
           stats.docsSkipped++;
@@ -313,16 +349,22 @@ export class IndexPipeline {
           source: 'docs' as const,
         };
 
+        if (!fileRevisionCurrent(filePath, sourceRevision)) { stats.docsSkipped++; continue; }
         this.store.upsertNode(node);
+        const version = this.store.snapshotIndexNode(node, filePath);
+        if (!version) { stats.docsSkipped++; continue; }
 
         const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags as string[] : [];
         const aliases = Array.isArray(frontmatter.aliases) && (frontmatter.aliases as unknown[]).every(a => typeof a === 'string')
           ? frontmatter.aliases as string[]
           : undefined;
         const embeddingText = Embedder.buildEmbeddingText(title, tags, node.content, aliases);
+        if (!this.store.captureNodeAllowed(frontmatter, filePath)) { stats.docsSkipped++; continue; }
         const embedding = await this.embedder.embed(embeddingText);
-        this.store.upsertEmbedding(id, embedding);
-        this.store.upsertSync(id, mtime);
+        if (!this.store.captureNodeAllowed(frontmatter, filePath)) { stats.docsSkipped++; continue; }
+        if (!this.store.commitIndexedEmbedding(id, embedding, { expectedVersion: version, mtime, sourcePath: filePath, sourceRevision }).committed) {
+          stats.docsSkipped++; continue;
+        }
         stats.docsIndexed++;
       }
     }
@@ -374,6 +416,7 @@ export class IndexPipeline {
     for (const graphRoot of graphRoots) {
       // Skip roots intended for a different machine
       if (graphRoot.host !== currentHost) continue;
+      if (!this.store.captureNodeAllowed({}, graphRoot.graphJsonPath)) { stats.filesSkipped++; continue; }
 
       // Skip missing graph.json silently
       try {

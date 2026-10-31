@@ -16,6 +16,8 @@ Contract:
     Any other change keeps the old copy as `<name>.v<mtime>.gz` beside the new one.
   - OWNER-ONLY. umask 077, directories 0700, files 0600.
   - Portable: stdlib only, no macOS or GNU tools, so the Linux port reuses it.
+  - Restricted policies use source-bound immutable revision directories through
+    scoped_archive.py. Existing copies and the global legacy index stay intact.
   - Writes index.tsv in the format engram_explain reads
     (runtime/src/lib/engram/provenance.ts): a `# engram.transcript-index.v1
     dest=local:<dir> generated=<UTC>` header, then archive_key, storage_kind,
@@ -34,6 +36,8 @@ import sys
 from pathlib import Path
 
 from install_config import read_engram_env
+from capture_policy import CapturePolicyBlocked, read_capture_policy, require_unbound_capture_allowed
+from scoped_archive import archive_selected
 
 MANIFEST = ".manifest.json"
 INDEX = "index.tsv"
@@ -50,6 +54,7 @@ def sources(claude_dir: Path, codex_home: Path) -> list[tuple[str, Path]]:
 
 
 def prefix_sha256(path: Path, length: int) -> str:
+    require_unbound_capture_allowed([path])
     h = hashlib.sha256()
     left = length
     with path.open("rb") as f:
@@ -59,37 +64,57 @@ def prefix_sha256(path: Path, length: int) -> str:
                 break
             h.update(block)
             left -= len(block)
+    require_unbound_capture_allowed([path])
     return h.hexdigest() if left == 0 else ""
 
 
 def write_gzip(src: Path, dest: Path, size: int) -> str:
     """Compress the first `size` bytes of src to dest atomically; return their sha256."""
+    require_unbound_capture_allowed([src, dest])
     dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = dest.with_name(f".{dest.name}.tmp-{os.getpid()}")
     h = hashlib.sha256()
     left = size
-    with src.open("rb") as f, tmp.open("wb") as raw, \
-            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as out:
-        while left > 0:
-            block = f.read(min(CHUNK, left))
-            if not block:
-                break
-            h.update(block)
-            out.write(block)
-            left -= len(block)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, dest)
+    try:
+        with src.open("rb") as f, tmp.open("wb") as raw, \
+                gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as out:
+            while left > 0:
+                require_unbound_capture_allowed([src, dest])
+                block = f.read(min(CHUNK, left))
+                if not block:
+                    break
+                h.update(block)
+                out.write(block)
+                left -= len(block)
+        os.chmod(tmp, 0o600)
+        require_unbound_capture_allowed([src, dest])
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
     return h.hexdigest()
 
 
 def write_atomic(path: Path, text: str) -> None:
+    require_unbound_capture_allowed([path])
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(text)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(text)
+        os.chmod(tmp, 0o600)
+        require_unbound_capture_allowed([path])
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def archive(root: Path, trees: list[tuple[str, Path]], now: dt.datetime | None = None) -> dict:
+    try:
+        require_unbound_capture_allowed([root])
+        return _archive(root, trees, now)
+    except CapturePolicyBlocked:
+        return archive_selected(root, trees)
+
+
+def _archive(root: Path, trees: list[tuple[str, Path]], now: dt.datetime | None) -> dict:
     os.umask(0o077)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(root, 0o700)
@@ -102,6 +127,7 @@ def archive(root: Path, trees: list[tuple[str, Path]], now: dt.datetime | None =
         if not tree.is_dir():
             continue
         for src in sorted(tree.rglob("*.jsonl")):
+            require_unbound_capture_allowed([root, src])
             if not src.is_file() or src.is_symlink():
                 continue
             logical = f"{store}/{src.relative_to(tree).as_posix()}"
@@ -109,19 +135,30 @@ def archive(root: Path, trees: list[tuple[str, Path]], now: dt.datetime | None =
             size, mtime = st.st_size, int(st.st_mtime)
             dest = root / f"{logical}.gz"
             prev = manifest.get(logical)
+            moved = None
             if prev and prev["size"] == size and prev["mtime"] == mtime and dest.exists():
                 continue
             if prev and dest.exists():
                 appended = size >= prev["size"] and prefix_sha256(src, prev["size"]) == prev["sha256"]
                 if not appended:
                     # Rewritten or truncated at the source: keep what was archived.
-                    os.replace(dest, dest.with_name(f"{src.name}.v{prev['mtime']}.gz"))
+                    moved = dest.with_name(f"{src.name}.v{prev['mtime']}.gz")
+                    os.replace(dest, moved)
                     versioned += 1
                 else:
                     updated += 1
             else:
                 added += 1
-            digest = write_gzip(src, dest, size)
+            try:
+                digest = write_gzip(src, dest, size)
+            except Exception:
+                if moved is not None:
+                    try:
+                        os.link(moved, dest)
+                        moved.unlink()
+                    except FileExistsError:
+                        pass  # Preserve both versions if another writer supplied a destination.
+                raise
             manifest[logical] = {"size": size, "mtime": mtime, "sha256": digest}
     write_atomic(root / MANIFEST, json.dumps(manifest, indent=0, sort_keys=True) + "\n")
     stamp = (now or dt.datetime.now(dt.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -138,6 +175,11 @@ def archive(root: Path, trees: list[tuple[str, Path]], now: dt.datetime | None =
 
 
 def size_line(root: Path) -> str:
+    try:
+        require_unbound_capture_allowed([root])
+    except CapturePolicyBlocked:
+        return ('Transcript archive: selected-source mode; legacy coverage unverified'
+                if read_capture_policy()['state'] == 'valid' else 'Transcript archive: capture policy deferred')
     if not root.is_dir():
         return f"Transcript archive: none yet at {root}"
     total = files = 0
@@ -165,6 +207,13 @@ def main(argv: list[str] | None = None) -> int:
     claude_dir = a.claude_dir or Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     codex_home = a.codex_home or Path(os.environ.get("CODEX_HOME") or conf.get("CODEX_HOME") or Path.home() / ".codex")
     result = archive(a.archive, sources(claude_dir, codex_home))
+    if result.get('selected'):
+        print(f"selected transcript archive: {result['added']} new, {result['retained']} retained, "
+              f"{result['policy_deferred_sources']} deferred, {result['errors']} errors; unsupported stores: {result['unsupported_stores']}")
+        return 0
+    if result.get('policy_deferred'):
+        print('transcript archive deferred: source_context_unknown')
+        return 0
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] transcript archive: {result['sessions']} sessions "
           f"(+{result['added']} new, {result['updated']} grown, {result['versioned']} kept as versions) in {a.archive}")

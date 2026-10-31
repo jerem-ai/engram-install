@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { statSync } from 'node:fs';
+import { CorpusReadScope } from './corpus-read-consistency.js';
 
 const DEFAULT_RESULTS = 6;
 const MAX_RESULTS = 12;
@@ -139,6 +140,7 @@ export function recallFederatedEvidence<SourceKind extends string>(
   databasePath: string,
   query: string,
   requestedLimit = DEFAULT_RESULTS,
+  readScope?: CorpusReadScope,
 ): FederatedRecallResult<SourceKind> {
   const source: FederatedCorpusSource = {
     kind: 'federated_evidence_database',
@@ -157,14 +159,15 @@ export function recallFederatedEvidence<SourceKind extends string>(
   }
 
   let db: Database.Database | undefined;
+  const scope = readScope ?? new CorpusReadScope();
   try {
-    db = new Database(databasePath, { readonly: true, fileMustExist: true });
-    db.pragma('query_only = ON');
+    db = scope.database(databasePath).db;
     const schemaVersion = validateSchema(db, adapter);
     const metadata = databaseMetadata(db, adapter, databasePath, schemaVersion);
     const limit = normalizeLimit(requestedLimit);
     const rows = searchRows(db, terms, limit);
     const evidence = rows.map(row => evidenceForRow(db!, adapter, row));
+    scope.assertCurrent();
 
     if (evidence.length === 0) {
       return noEvidence(
@@ -202,8 +205,15 @@ export function recallFederatedEvidence<SourceKind extends string>(
       error: safeError(adapter.databaseLabel, error),
     };
   } finally {
-    db?.close();
+    if (!readScope) scope.close();
   }
+}
+
+export function invalidateCorpusEvidence<T extends string>(result: FederatedRecallResult<T>): FederatedRecallResult<T> {
+  return { ...result, status: 'source_unavailable',
+    source: { kind: result.source.kind, corpus_id: result.source.corpus_id, path: result.source.path },
+    answer_contract: { action: 'do_not_answer_from_this_source', note: 'The corpus changed during this read. Retry against the current dataset.' },
+    evidence: [], error: 'source_changed' };
 }
 
 function searchTerms(query: string, corpusStopWords: readonly string[]): string[] {

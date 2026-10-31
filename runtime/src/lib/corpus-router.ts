@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import {
   recallFederatedEvidence,
@@ -7,8 +5,9 @@ import {
 } from './federated-corpus.js';
 import { createGenericCorpusAdapter } from './corpus-adapter.js';
 import { recallHybridCorpus } from './corpus-hybrid-recall.js';
-import { loadCorpusRegistry } from './corpus-registry.js';
+import { parseCorpusRegistry } from './corpus-registry.js';
 import type { CorpusEmbeddingProvider } from './corpus-semantic-index.js';
+import { CorpusReadScope } from './corpus-read-consistency.js';
 
 export type CorpusRetrievalPolicy = 'lexical' | 'hybrid' | 'shadow';
 export type CorpusIndexPolicy = 'none' | 'digest_bound_optional';
@@ -46,7 +45,7 @@ export interface CorpusRoutePlan {
   selectedCollectionIds: string[];
   candidates: CorpusRouteCandidate[];
   uncoveredNeed: boolean;
-  reason: 'no_matching_collection' | 'automatic_routing_disabled' | null;
+  reason: 'no_matching_collection' | 'automatic_routing_disabled' | 'source_changed' | null;
 }
 
 export interface PlanCorpusRouteInput {
@@ -65,6 +64,7 @@ export interface ExecuteCorpusRouteInput extends PlanCorpusRouteInput {
   limit: number;
   semanticMinSimilarity?: number;
   forceLexical?: boolean;
+  readScope?: CorpusReadScope;
 }
 
 export interface CorpusRouteExecution {
@@ -87,7 +87,7 @@ export interface CorpusCollectionExecution {
   domain: string;
   requestedPolicy: CorpusRetrievalPolicy;
   servedPolicy: 'lexical' | 'hybrid';
-  fallbackReason: 'forced_lexical' | 'semantic_index_unavailable' | 'semantic_index_invalid' | null;
+  fallbackReason: 'forced_lexical' | 'semantic_index_unavailable' | 'semantic_index_invalid' | 'source_changed' | null;
   maxQueryMs: number | null;
   served: TimedCorpusResult;
   shadow?: TimedCorpusResult & {
@@ -182,12 +182,27 @@ export function planCorpusRoute(
 export async function executeCorpusRoute(
   input: ExecuteCorpusRouteInput,
 ): Promise<CorpusRouteExecution> {
-  const registry = loadCorpusRegistry(input.registryPath).filter(item => item.enabled);
+  const scope = input.readScope ?? new CorpusReadScope();
+  const policyVersion = JSON.stringify(input.policy);
+  try {
+    const execution = await executeCorpusRouteWithinScope(input, scope);
+    return retainCurrentCorpusRoute(scope, execution, JSON.stringify(input.policy) === policyVersion);
+  } finally { if (!input.readScope) scope.close(); }
+}
+
+export function retainCurrentCorpusRoute(scope: CorpusReadScope, execution: CorpusRouteExecution, policyCurrent = true): CorpusRouteExecution {
+  if (policyCurrent && scope.current()) return execution;
+  return { ...execution, route: { ...execution.route, selectedCollectionIds: [], candidates: [], uncoveredNeed: true, reason: 'source_changed' }, collections: [] };
+}
+
+async function executeCorpusRouteWithinScope(input: ExecuteCorpusRouteInput, scope: CorpusReadScope): Promise<CorpusRouteExecution> {
+  const registry = parseCorpusRegistry(scope.text(input.registryPath)).filter(item => item.enabled);
   const route = planCorpusRoute(input.policy, registry.map(item => item.id), input);
   const policyById = new Map(input.policy.collections.map(item => [item.collectionId, item]));
   const collections: CorpusCollectionExecution[] = [];
 
   for (const collectionId of route.selectedCollectionIds) {
+    if (!scope.current()) break;
     const registration = registry.find(item => item.id === collectionId)!;
     const collectionPolicy = policyById.get(collectionId);
     const requestedPolicy = collectionPolicy?.retrievalPolicy ?? 'lexical';
@@ -198,6 +213,7 @@ export async function executeCorpusRoute(
       registration.database_path,
       input.query,
       input.limit,
+      scope,
     );
     const lexical = {
       elapsedMs: roundMilliseconds(performance.now() - lexicalStarted),
@@ -217,8 +233,7 @@ export async function executeCorpusRoute(
       continue;
     }
 
-    const sourceDatabaseSha256 = input.sourceDatabaseSha256?.[collectionId]
-      ?? await sha256File(registration.database_path);
+    const sourceDatabaseSha256 = input.sourceDatabaseSha256?.[collectionId];
     const hybridStarted = performance.now();
     const hybrid = await recallHybridCorpus({
       collectionId,
@@ -231,6 +246,7 @@ export async function executeCorpusRoute(
       query: input.query,
       limit: input.limit,
       semanticMinSimilarity: input.semanticMinSimilarity ?? 0.3,
+      readScope: scope,
     });
     const hybridTimed = {
       elapsedMs: roundMilliseconds(performance.now() - hybridStarted),
@@ -339,16 +355,6 @@ function normalize(value: string): string {
 
 function rankingSignature(result: FederatedRecallResult): string {
   return JSON.stringify(result.evidence.map(item => [item.segment_id, item.source_id]));
-}
-
-function sha256File(path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const hash = createHash('sha256');
-    const stream = createReadStream(path);
-    stream.on('error', reject);
-    stream.on('data', chunk => hash.update(chunk));
-    stream.on('end', () => resolve(hash.digest('hex')));
-  });
 }
 
 function isObject(value: unknown): value is JsonObject {

@@ -1,3 +1,4 @@
+import { statementContextLabel } from "../../hooks/statement-context.mjs";
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { resolveConfig } from '../lib/config.js';
@@ -10,8 +11,9 @@ import { KnowledgeGraph } from '../lib/graph.js';
 import { Search } from '../lib/search.js';
 import { resolveNodeName } from '../lib/resolve.js';
 import { VaultWriter } from '../lib/writer.js';
+import { requireUnboundCaptureAllowed } from '../lib/capture-policy.js';
 import { searchMemoryHybrid, type MemorySearchOpts } from '../lib/memory-search.js';
-import { passageVectorsFor } from '../lib/passage-rescore.js';
+import { warmMemoryPassages } from '../lib/passage-rescore.js';
 import type { SearchResult } from '../lib/types.js';
 import { mkdirSync } from 'fs';
 import { join, posix } from 'node:path';
@@ -24,6 +26,7 @@ import {
 import {
   getMemorySourceAdmission,
   isPromotedMemorySource,
+  memorySourceGate,
   type MemoryAdmissionService,
 } from '../lib/engram/admission.js';
 import {
@@ -33,9 +36,10 @@ import {
 } from '../lib/engram/assertions.js';
 import { engramStatus } from '../lib/engram/status.js';
 import { registerBootstrapTools } from './bootstrap-tools.js';
+import { startupProfile } from '../lib/engram/startup-profile.js';
 import { LOCAL_MEMORY_ADMISSION } from './local-admission.js';
 import { GX460_CORPUS, recallGx460Evidence } from '../lib/gx460-recall.js';
-import { corpusRegistryPath, listCorpora, recallRegisteredCorpus, recallX1cEvidence } from '../lib/corpus-registry.js';
+import { corpusRegistryPath, listCorpora, recallRegisteredCorpus, recallU1Evidence, recallX1cEvidence } from '../lib/corpus-registry.js';
 import {
   corpusRoutingFlag,
   createCorpusRoutingRuntime,
@@ -100,15 +104,7 @@ async function ensureEmbedder(): Promise<void> {
  */
 export async function warmPassageCache(): Promise<number> {
   await ensureEmbedder();
-  const rows = store.db.prepare(
-    `SELECT id, title, content FROM nodes WHERE source = 'vault' AND id LIKE 'Memory/%'`,
-  ).all() as Array<{ id: string; title: string | null; content: string | null }>;
-  const passages = passageVectorsFor(embedder);
-  for (const r of rows) {
-    await passages.ensure([{ id: r.id, title: r.title ?? '', content: r.content ?? '' }]);
-    await new Promise(resolve => setImmediate(resolve)); // let queries interleave
-  }
-  return rows.length;
+  return warmMemoryPassages(store, embedder);
 }
 
 export async function searchLocalMemory(
@@ -202,18 +198,22 @@ export function createKgServer(options: KgServerOptions = {}): McpServer {
     };
   };
   const safeGraph = (): KnowledgeGraph => KnowledgeGraph.fromStore(store, isGenericGraphNode);
-  const admittedContradictions = () => getOpenContradictions(store.db).filter(c => {
-    const sources = store.db.prepare(`
-      SELECT a.source_node_id AS source_a, b.source_node_id AS source_b
-      FROM engram_assertions a JOIN engram_assertions b
-        ON a.id = ? AND b.id = ?
-    `).get(c.assertion_a_id, c.assertion_b_id) as {
-      source_a: string; source_b: string;
-    } | undefined;
-    return !!sources
-      && isPromotedMemorySource(store.db, sources.source_a)
-      && isPromotedMemorySource(store.db, sources.source_b);
-  });
+  // The queue shows facts agents already recall: promoted sources plus claims
+  // self-admitted in place. Unreviewed and quarantined memory stays out.
+  const contradictionSourceGate = () => memorySourceGate(store.db, 'admitted')!;
+  const admittedContradictions = () => {
+    const allowed = contradictionSourceGate();
+    return getOpenContradictions(store.db).filter(c => {
+      const sources = store.db.prepare(`
+        SELECT a.source_node_id AS source_a, b.source_node_id AS source_b
+        FROM engram_assertions a JOIN engram_assertions b
+          ON a.id = ? AND b.id = ?
+      `).get(c.assertion_a_id, c.assertion_b_id) as {
+        source_a: string; source_b: string;
+      } | undefined;
+      return !!sources && allowed(sources.source_a) && allowed(sources.source_b);
+    });
+  };
 
 if (!options.readOnly) server.tool(
   'kg_index',
@@ -268,7 +268,7 @@ server.tool(
       const meta = (r.frontmatter?.metadata ?? {}) as Record<string, unknown>;
       const prov = [meta.runtime ?? r.frontmatter?.runtime, meta.persona ?? r.frontmatter?.persona, meta.model ?? r.frontmatter?.model]
         .filter(Boolean).join(' · ');
-      return `**${r.title}** [informational_only] (score: ${r.score.toFixed(3)}${prov ? `, ${prov}` : ''})\n${r.excerpt}`;
+      return `**${r.title}** [informational_only] [${statementContextLabel(r.frontmatter)}] (score: ${r.score.toFixed(3)}${prov ? `, ${prov}` : ''})\n${r.excerpt}`;
     }).join('\n\n---\n\n');
     return { content: [{ type: 'text', text: formatted }] };
   }
@@ -648,7 +648,7 @@ registerCorpusRoutingTool(server, corpusRoutingRuntime);
 
 server.registerTool('engram_x1c_recall', {
   title: 'Recall Jeremy’s X1 Carbon Printer and Reference',
-  description: 'Use before answering about Jeremy’s 3D printer, Replicator, Bambu X1C/X1 Carbon capabilities, compatible filament, AMS, calibration, maintenance, repairs, or printing setup. Returns dated equipment context alongside cited manufacturer documentation. A printer profile or downloaded 3MF does not prove installed hardware.',
+  description: 'Use before answering about Jeremy’s Bambu printer, Replicator, X1C/X1 Carbon capabilities, compatible filament, AMS, calibration, maintenance, repairs, or printing setup. Returns dated equipment context alongside cited manufacturer documentation. A printer profile or downloaded 3MF does not prove installed hardware.',
   inputSchema: {
     query: z.string().trim().min(1).max(1000),
     limit: z.number().int().min(1).max(12).optional(),
@@ -656,6 +656,18 @@ server.registerTool('engram_x1c_recall', {
   annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 }, async ({ query, limit }) => ({
   content: [{ type: 'text', text: JSON.stringify(recallX1cEvidence(query, limit)) }],
+}));
+
+server.registerTool('engram_u1_recall', {
+  title: 'Recall Jeremy’s Snapmaker U1 Printer and Reference',
+  description: 'Use before answering about Jeremy’s Snapmaker U1, its four toolheads, hotends, filament loading, Full Spectrum or multi-color printing, top cover, calibration, firmware, maintenance, error codes, repairs, or Snapmaker Orca slicing. Returns dated equipment context alongside cited Snapmaker documentation. A printer profile or downloaded 3MF does not prove installed hardware.',
+  inputSchema: {
+    query: z.string().trim().min(1).max(1000),
+    limit: z.number().int().min(1).max(12).optional(),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async ({ query, limit }) => ({
+  content: [{ type: 'text', text: JSON.stringify(recallU1Evidence(query, limit)) }],
 }));
 
 server.registerTool('engram_corpus_recall', {
@@ -727,11 +739,10 @@ server.tool(
 
 if (!options.readOnly) server.tool(
   'engram_detect_contradictions',
-  'Scan assertions for new contradictions. Finds pairs of current assertions with the same subject+predicate but different objects. Returns any newly detected cases. Duplicates (already-open cases) are skipped.',
+  'Scan assertions for new contradictions. Finds current assertions that give different values for the same single-value slot (a default, status, version and similar), matching reworded predicates and ignoring case and rewording of the same value. Multi-value predicates such as prefers or owns are not compared. Returns newly detected cases; already-open cases are skipped.',
   {},
   async () => {
-    const cases = detectContradictions(store.db, sourceNodeId =>
-      isPromotedMemorySource(store.db, sourceNodeId));
+    const cases = detectContradictions(store.db, contradictionSourceGate());
     const totalOpen = admittedContradictions().length;
     return {
       content: [{ type: 'text', text: JSON.stringify({
@@ -850,6 +861,7 @@ if (!options.readOnly && options.memoryAdmission) server.tool(
     confidence: z.number().min(0).max(1).optional().describe('Confidence in this fact, 0.0–1.0 (default 1.0)'),
   },
   async ({ subject, predicate, object, source_node_id, confidence }) => {
+    requireUnboundCaptureAllowed();
     const result = options.memoryAdmission!.submit(store.db, {
       origin: 'model_derived',
       subject,
@@ -921,7 +933,7 @@ server.registerTool(
 
 }  // end if (engramEnabled)
 
-  registerBootstrapTools(server);
+  registerBootstrapTools(server, undefined, (identity, label) => startupProfile(store.db, identity, label));
 
   return server;
 } // end createKgServer

@@ -34,6 +34,10 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+# Keep lazy imports on this immutable release if `current` changes mid-run.
+EXTRACTION_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(EXTRACTION_DIRECTORY))
+
 try:
     from claude_vault.code_parser import ClaudeCodeHistoryParser
 except ImportError:  # a fresh install has no claude_vault package; same message rules, vendored
@@ -41,6 +45,13 @@ except ImportError:  # a fresh install has no claude_vault package; same message
 from request_sizing import size_request
 import support_check
 from install_config import read_engram_env
+from capture_binding import bound_file_capture, bound_hermes_capture
+from source_turns import bind_current_projection, current_citation_context, current_source_turns, source_turn_scope
+from source_origin import codex_secondary_session, guardian_review_only
+from statement_context import statement_context, STATEMENT_SCHEMA
+from capture_policy import (CapturePolicyBlocked, capture_scope, checked_capture_call,
+                            current_capture_sources, require_capture_allowed, read_capture_policy,
+                            capture_artifact_allowed, capture_decision, include_capture_dependencies, include_capture_paths)
 
 # Per-install settings (~/.config/engram/engram.env). They only fill gaps, and with no
 # file (Jeremy's machines) every value below is the one this script always used.
@@ -97,9 +108,17 @@ Prefer the user's own words over the assistant's. If you cannot find a verbatim
 passage that supports a memory, that memory is inference, not evidence — omit it.
 Never attribute to Jeremy something only the assistant proposed; if the passage you
 would cite is the assistant speaking, the memory is not a user preference.
+Keep each quote self-contained: retain the sentence's subject, conditions,
+uncertainty, negation and action state. Do not isolate "is ready" from "if the
+owner approves", or a result from the sentence naming its system. If another
+turn identifies "it", "her" or "the job", include that turn's identifying words
+as another exact passage. Prefer complete sentences or short paragraphs within
+1500 characters per passage, because existing judges cap each passage there.
+If the necessary evidence cannot fit without losing a material qualifier, omit
+the assertion. The generated memory's own text cannot supply missing evidence.
 
 Four types:
-- feedback: a correction the user gave, OR a non-obvious approach they validated without pushback. Lead with the rule, then why, then how to apply.
+- feedback: a correction the user gave, OR a non-obvious approach they explicitly validated. Preserve the correction or preference, its scope, and its attribution. Write a standing rule only when the source establishes an ongoing instruction.
 - user: a durable fact about the user's role, expertise, preferences, or working style that changes how to collaborate.
 - project: a significant decision, milestone, architectural choice, or known blocker useful at the start of the next session.
 - reference: an external system/tool/resource named with a purpose.
@@ -130,6 +149,18 @@ Use null when ambiguous or when type is not feedback. A technical example does
 not turn a portable working preference into domain feedback. These fields are
 unreviewed model annotations, and do not establish support or retrieval authority.
 
+STATEMENT FORCE: include statement with kind (fact, preference, standing_instruction,
+advice, or unknown) and scope (project, portable, or unknown). Preserve that same
+force and scope in description, body, and every assertion. A complaint supports
+feedback about that experience; it does not establish an unspoken mental state.
+An approved setting establishes what was approved at that time. Retaining it forever requires separate source evidence.
+A request made during one task does not establish a rule for future tasks. Keep
+one-time requests in session history by omitting them here. An assistant's advice
+must remain attributed advice. A standing instruction requires source evidence of
+ongoing intent and its actual project or portable scope. Useful preferences may
+still guide collaboration without becoming requirements. These annotations are
+unreviewed model output; they never certify support or grant current permission.
+
 TYPED CLAIMS: include assertions, an array of at most ten atomic claims supported
 by this memory's passages. Use a specific lowercase predicate such as prefers,
 uses, depends_on, runs_on, forbids, or a precise dotted namespace. Never use
@@ -146,7 +177,7 @@ claim qualifies. These are unreviewed candidates, never promoted truth.
 Return STRICT JSON: an array of objects, each:
 {"type":"feedback|user|project|reference","slug":"kebab-case-short","description":"one line, specific enough to judge relevance later","body":"the memory; for feedback/project include Why and How-to-apply","passages":["exact verbatim substring copied from the transcript that supports this memory"],"supersedes":"optional: exact existing filename this memory replaces; omit unless the old memory is now false"}
 Also include project (an allowed name or null) and feedback_kind
-(working_style, domain, or null), plus assertions on each object.
+(working_style, domain, or null), statement, plus assertions on each object.
 Return [] if nothing qualifies. No prose outside the JSON."""
 SYSTEM_PROMPT = SYSTEM_PROMPT.replace("Jeremy", USER_NAME)  # two mentions, both the human
 SYSTEM_PROMPT += "\nAllowed project names: " + ", ".join(PROJECT_NAMES) + "."
@@ -172,6 +203,7 @@ MEMORY_RESPONSE_SCHEMA = {
             "supersedes": {"type": "string"},
             "project": {"type": ["string", "null"], "enum": [*PROJECT_NAMES, None]},
             "feedback_kind": {"type": ["string", "null"], "enum": ["working_style", "domain", None]},
+            "statement": STATEMENT_SCHEMA,
             "assertions": {"type": "array", "maxItems": 10, "items": {
                 "type": "object", "properties": {
                     "subject": {"type": "string"}, "predicate": {"type": "string"},
@@ -224,6 +256,11 @@ AGENT_SIGNATURES = (
 
 
 def is_agent_session(conv, extra_signatures=()) -> bool:
+    # Older guardian runs used exec provenance. Use complete native user turns,
+    # not role headers embedded in their quoted transcript payloads.
+    users = (strip_envelopes(m.content or '') for m in conv.messages if m.role in ('human', 'user'))
+    if guardian_review_only(users):
+        return True
     for m in conv.messages:
         if m.role in ("human", "user") and (m.content or "").strip():
             head = m.content[:600].lower()
@@ -248,9 +285,12 @@ def strip_envelopes(text: str) -> str:
     return ENVELOPE.sub(" ", text)
 
 
-def build_transcript(conv, envelopes: bool = True) -> str:
-    """The transcript the model reads. `envelopes=False` drops harness envelopes from user turns."""
-    parts = []
+def build_transcript(conv, envelopes: bool = True, source_ids: bool = False, complete: bool = False) -> str:
+    """Render source text; complete mode leaves length admission to native sizing.
+
+    `envelopes=False` drops harness envelopes from user turns.
+    """
+    parts = []; segments = []; offset = 0
     for m in conv.messages:
         role = "User" if m.role in ("human", "user") else "Claude"
         content = strip_tools(m.content or "").strip()
@@ -258,15 +298,36 @@ def build_transcript(conv, envelopes: bool = True) -> str:
             content = strip_envelopes(content).strip()
         if not content:
             continue
-        if len(content) > MAX_MSG_CHARS:
+        if not complete and len(content) > MAX_MSG_CHARS:
             content = content[:MAX_MSG_CHARS] + " …[truncated]"
-        parts.append(f"## {role}\n{content}")
+        part = f"## {role}\n{content}"
+        separator = 2 if parts else 0
+        native_role = 'user' if m.role in ('human', 'user') else m.role
+        segments.append((offset, offset + separator + len(part),
+                         offset + separator + len(f'## {role}\n'), native_role, m.content or ''))
+        offset += separator + len(part)
+        parts.append(part)
     text = "\n\n".join(parts)
-    if len(text) > MAX_SESSION_CHARS:
+    if not complete and len(text) > MAX_SESSION_CHARS:
         # keep head + tail (decisions often land at the end)
         head = text[: MAX_SESSION_CHARS // 2]
         tail = text[-MAX_SESSION_CHARS // 2 :]
+        if source_ids:
+            half = MAX_SESSION_CHARS // 2
+            gap = len("\n\n…[middle elided]…\n\n")
+            tail_start = len(text) - half
+            clipped = []
+            for start, end, body_start, role, original in segments:
+                if start < half:
+                    clipped.append((start, min(end, half), body_start, role, original))
+                if end > tail_start:
+                    shift = half + gap - tail_start
+                    clipped.append((max(start, tail_start) + shift, end + shift,
+                                    max(body_start, tail_start) + shift, role, original))
+            segments = sorted(clipped)
         text = head + "\n\n…[middle elided]…\n\n" + tail
+    if source_ids:
+        bind_current_projection(text, segments)
     return text
 
 
@@ -337,17 +398,47 @@ def archived_transcript(session_id: str) -> str | None:
         return None  # archive is a fallback; never let it break a live run
 
 
-def existing_memory_context(mem_dir: Path) -> str:
+def existing_memory_context(mem_dir: Path, *, read_text=None, observe_names=None) -> str:
     if not mem_dir.is_dir():
         return "(none yet)"
     lines = []
+    snapshot = read_capture_policy()
+    restricted = not capture_decision(snapshot, None)['allowed']
     idx = mem_dir / "MEMORY.md"
-    if idx.exists():
-        lines.append("MEMORY.md index:\n" + idx.read_text()[:3000])
+    if idx.exists() and not restricted:
+        lines.append("MEMORY.md index:\n" + (read_text(idx) if read_text else idx.read_text())[:3000])
     names = [p.name for p in mem_dir.glob("*.md") if p.name != "MEMORY.md"]
+    if restricted:
+        import frontmatter as _fm
+        allowed = []
+        for name in names:
+            try:
+                post = _fm.loads(read_text(mem_dir/name)) if read_text else _fm.load(mem_dir/name)
+            except Exception as error:
+                if read_text is not None:
+                    raise
+                # An unreadable legacy note supplies no dedup or policy evidence.
+                # Leave its bytes intact and continue with independently allowed notes.
+                print(f"  WARN: unreadable existing memory {name}: {type(error).__name__}", file=sys.stderr)
+                continue
+            if capture_artifact_allowed(snapshot, post.metadata):
+                allowed.append(name)
+                metadata = post.metadata.get('metadata') if isinstance(post.metadata.get('metadata'), dict) else {}
+                include_capture_dependencies(metadata.get('capture_sources', post.metadata.get('capture_sources', [])))
+        names = allowed
+    if observe_names is not None:
+        observe_names([mem_dir/name for name in names])
     if names:
         lines.append("existing memory files: " + ", ".join(sorted(names)))
-    return "\n\n".join(lines) or "(none yet)"
+    context = "\n\n".join(lines) or "(none yet)"
+    if lines and not restricted:
+        # The legacy index has no complete dependency manifest. Record that
+        # uncertainty, so a later restrictive policy cannot treat it as allowed.
+        import hashlib
+        include_capture_dependencies([{'source_id': 'legacy-dedup:' + hashlib.sha256(str(mem_dir).encode()).hexdigest(),
+            'revision': hashlib.sha256(context.encode()).hexdigest(), 'project_id': None, 'worktree_id': None,
+            'paths': [str(mem_dir.resolve())], 'complete': False}])
+    return context
 
 
 def mark_superseded(old: Path, new_name: str) -> bool:
@@ -397,6 +488,7 @@ def validate_items(items: list, transcript: str) -> None:
             raise ValueError(f"memory {index}: project must be an allowed name or null")
         if kind is not None and (kind not in ("working_style", "domain") or item["type"] != "feedback"):
             raise ValueError(f"memory {index}: feedback_kind is only valid on feedback")
+        statement_context(item)
         claims = item.get("assertions", [])
         if not isinstance(claims, list) or len(claims) > 10:
             raise ValueError(f"memory {index}: assertions must contain at most ten claims")
@@ -435,15 +527,42 @@ def validate_items(items: list, transcript: str) -> None:
                 raise ValueError(f"memory {index}: valid_to precedes valid_from")
 
 
-def write_memory(mem_dir: Path, item: dict, source_session: str = "",
-                 provenance: dict | None = None, slug_suffix: str = "") -> Path:
-    mem_dir.mkdir(parents=True, exist_ok=True)
+def _yaml_json(value) -> str:
+    """Keep native Unicode exact in JSON values embedded in YAML frontmatter.
+
+    YAML folds a literal NEL. Escaping every non-ASCII character instead would
+    split astral characters into surrogate halves in Python YAML readers.
+    """
+    return json.dumps(value, ensure_ascii=False).translate({
+        0x85: r'\u0085', 0x2028: r'\u2028', 0x2029: r'\u2029',
+    })
+
+
+_READ_EXISTING_MEMORY = object()
+
+
+def memory_target(mem_dir: Path, item: dict, slug_suffix: str = "") -> Path:
+    base = re.sub(r"[^a-z0-9-]", "", item["slug"].lower().replace(" ", "-"))[:50]
+    slug = f"{base}-{slug_suffix}" if slug_suffix else base
+    return mem_dir / f"{item['type']}_{slug}.md"
+
+
+def render_memory(mem_dir: Path, item: dict, source_session: str = "",
+                  provenance: dict | None = None, slug_suffix: str = "", *,
+                  created_at: str | None = None, existing_bytes=_READ_EXISTING_MEMORY,
+                  create_directory: bool = True, strict_existing: bool = False) -> tuple[Path, str, str | None]:
+    """Render the existing note format, optionally from a frozen predecessor."""
+    require_capture_allowed()
+    statement = statement_context(item)  # legacy output remains explicitly unknown
     typ = item["type"]
     # Truncate the BASE before appending slug_suffix, so a disambiguating suffix
     # (e.g. a session hash) always survives — never sliced off by the length cap.
     base = re.sub(r"[^a-z0-9-]", "", item["slug"].lower().replace(" ", "-"))[:50]
     slug = f"{base}-{slug_suffix}" if slug_suffix else base
-    fn = mem_dir / f"{typ}_{slug}.md"
+    fn = memory_target(mem_dir, item, slug_suffix)
+    include_capture_paths([mem_dir, fn])
+    if create_directory:
+        mem_dir.mkdir(parents=True, exist_ok=True)
     # Loop A (supersession at write time): the model may declare that this memory
     # replaces an existing one. Validate hard: an exact filename in THIS store
     # (same-store stage; cross-store pairs are Loop B's sweep, FM-A3), never the
@@ -455,19 +574,21 @@ def write_memory(mem_dir: Path, item: dict, source_session: str = "",
         if target == fn.name:
             target = None
         elif not target or "/" in target or not (mem_dir / target).is_file():
+            if strict_existing:
+                raise ValueError('memory supersession target unavailable')
             print(f"  WARN: supersedes={target!r} is not an existing file in {mem_dir.name}; "
                   f"writing {fn.name} without a supersession mark", file=sys.stderr)
             target = None
-    supersedes_line = f"supersedes: {target}\n" if target else ""
-    created = datetime.now(timezone.utc).astimezone().isoformat()
-    src = f"  source_session: {source_session}\n" if source_session else ""
+    supersedes_line = f"supersedes: {_yaml_json(target) if strict_existing else target}\n" if target else ""
+    created = created_at if created_at is not None else datetime.now(timezone.utc).astimezone().isoformat()
+    src = f"  source_session: {_yaml_json(source_session) if strict_existing else source_session}\n" if source_session else ""
     # Persist the citations. A claim whose supporting span is on the file can be
     # re-checked without re-reading the whole transcript, which matters most once
     # the transcript itself has aged out of the local store.
     passages = [str(q) for q in (item.get("passages") or []) if str(q).strip()]
     if passages:
         src += "  passages:\n" + "".join(
-            "    - " + json.dumps(q) + "\n" for q in passages)
+            "    - " + _yaml_json(q) + "\n" for q in passages)
     # Provenance: queryable attributes under metadata (matchesProvenance reads
     # metadata.* first). Partition key is project x persona; runtime+model are
     # attributes, never the key — so a persona's memory survives model/runtime swaps.
@@ -475,23 +596,24 @@ def write_memory(mem_dir: Path, item: dict, source_session: str = "",
     # tenant/principal are stamped from the start even though nothing enforces
     # scoping yet. The field is nearly free now; backfilling identity later is
     # impossible for any memory whose source transcript has already expired.
-    for key in ("tenant", "principal", "runtime", "persona", "model", "extractor_model"):
+    for key in ("tenant", "principal", "runtime", "persona", "model", "extractor_model", "extractor_profile"):
         val = (provenance or {}).get(key)
         if val:
-            prov += f"  {key}: {val}\n"
+            prov += f"  {key}: {_yaml_json(val) if strict_existing else val}\n"
     for key in ("project", "feedback_kind"):
         if item.get(key) is not None:
-            prov += f"  {key}: {json.dumps(item[key])}\n"
+            prov += f"  {key}: {_yaml_json(item[key])}\n"
+    prov += f"  statement_context: {_yaml_json(statement)}\n"
     if item.get("support"):
         # Write-time support check (Phase 5): do the cited passages back the memory?
-        prov += f"  support: {item['support']}\n  support_check: {support_check.prompt_sha256()[:12]}\n"
+        prov += f"  support: {_yaml_json(item['support']) if strict_existing else item['support']}\n  support_check: {support_check.prompt_sha256()[:12]}\n"
     if any(item.get(key) is not None for key in ("project", "feedback_kind")):
         prov += "  scope_review: unreviewed\n"
     if item.get("assertions"):
         # Keep generated claims separate from curated top-level assertions and
         # memory-wide currency fields. Admission state lives in the candidates
         # table, not on the note (the assertion_review tag was dropped 2026-10-20).
-        prov += f"  assertions: {json.dumps(item['assertions'], ensure_ascii=False)}\n"
+        prov += f"  assertions: {_yaml_json(item['assertions'])}\n"
     # Curated-key preservation: canonical/aliases (the Engram canonical layer)
     # and any other hand-added top-level frontmatter are curation the model
     # knows nothing about. A re-extraction of a grown session overwrites the
@@ -501,32 +623,68 @@ def write_memory(mem_dir: Path, item: dict, source_session: str = "",
     # blank lines, and YAML comments — two review rounds, 2026-06-11) and carry
     # over every key write_memory doesn't itself regenerate.
     curated = ""
-    if fn.exists():
+    if (fn.exists() if existing_bytes is _READ_EXISTING_MEMORY else existing_bytes is not None):
         try:
             import frontmatter as _fmlib
             import yaml as _yaml
-            old_meta = _fmlib.load(fn).metadata
+            old_meta = (_fmlib.load(fn) if existing_bytes is _READ_EXISTING_MEMORY
+                        else _fmlib.loads(existing_bytes.decode('utf8'))).metadata
+            if not capture_artifact_allowed(read_capture_policy(), old_meta):
+                raise CapturePolicyBlocked('predecessor_excluded')
+            if current_capture_sources() is not None:
+                old_sources = (old_meta.get('metadata') or {}).get('capture_sources')
+                if old_sources:
+                    include_capture_dependencies(old_sources)
+                else:
+                    include_capture_dependencies([{'source_id': 'legacy-curation:' + hashlib.sha256(str(fn).encode()).hexdigest(),
+                        'revision': hashlib.sha256(fn.read_bytes() if existing_bytes is _READ_EXISTING_MEMORY else existing_bytes).hexdigest(), 'project_id': None,
+                        'worktree_id': None, 'paths': [str(fn.resolve())], 'complete': False}])
             keep = {k: v for k, v in old_meta.items()
                     if k not in ("name", "description", "metadata", "created")
                     and not (k == "supersedes" and target)}
             if keep:
                 curated = _yaml.safe_dump(keep, default_flow_style=False,
                                           sort_keys=False, allow_unicode=True)
+        except CapturePolicyBlocked:
+            raise
         except Exception as e:
+            if strict_existing:
+                raise ValueError("memory predecessor metadata unavailable") from None
             print(f"  WARN: could not read existing {fn.name} for curated-key preservation: {e}", file=sys.stderr)
+    policy_fingerprint = require_capture_allowed()
+    capture_sources = current_capture_sources()
+    if capture_sources:
+        prov = f"  capture_policy: {policy_fingerprint}\n  capture_sources: {_yaml_json(capture_sources)}\n" + prov
+    turns = current_source_turns(item, source_session)
+    if turns is not None:
+        prov += f"  source_turns: {_yaml_json(turns)}\n"
+    context = current_citation_context(item, source_session)
+    if context is not None:
+        prov += f"  citation_context: {_yaml_json(context)}\n"
     fm = (
         f"---\nname: {slug}\n"
         f"{curated}"
         f"{supersedes_line}"
-        f"description: {json.dumps(item['description'])}\n"
+        f"description: {_yaml_json(item['description'])}\n"
         f"metadata:\n  type: {typ}\n  source: extracted\n{prov}{src}"
         f"created: '{created}'\n---\n\n"
     )
+    return fn, fm + item["body"].strip() + "\n", target
+
+
+def write_memory(mem_dir: Path, item: dict, source_session: str = "",
+                 provenance: dict | None = None, slug_suffix: str = "") -> Path:
+    fn, document, target = render_memory(mem_dir, item, source_session, provenance, slug_suffix)
     # Atomic write (tmp + replace): the 30-min vault mirror may read concurrently
     # during a long extraction run — never expose a torn/half-written file.
     tmp = fn.with_suffix(".md.tmp")
-    tmp.write_text(fm + item["body"].strip() + "\n")
-    os.replace(tmp, fn)
+    try:
+        require_capture_allowed()
+        tmp.write_text(document)
+        require_capture_allowed()
+        os.replace(tmp, fn)
+    finally:
+        tmp.unlink(missing_ok=True)
     if target:
         mark_superseded(mem_dir / target, fn.name)
     return fn
@@ -593,13 +751,19 @@ CODEX_USER_NOISE = ("# agents.md instructions", "<permissions instructions",
                     "<recommended_plugins")
 
 
-def _codex_load(path: Path):
+def _jsonl_records(path):
+    with path.open('r', encoding='utf8', errors='ignore') as fh:
+        for line in fh:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+def _codex_load(path: Path, records=None):
     meta, messages, model = {}, [], ""
-    for line in path.read_text(errors="ignore").splitlines():
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
+    projected_chars = 0
+    for d in records if records is not None else _jsonl_records(path):
         t, p = d.get("type"), d.get("payload") or {}
         if t == "session_meta":
             meta = p
@@ -614,6 +778,9 @@ def _codex_load(path: Path):
             if role == "user" and any(text.lower().startswith(s) for s in CODEX_USER_NOISE):
                 continue
             if text.strip():
+                projected_chars += len(text)
+                if projected_chars > 64 * 1024 * 1024:
+                    raise CapturePolicyBlocked('projection_size_limit')
                 messages.append((role, text))
     return meta, _conv(messages), model
 
@@ -624,14 +791,20 @@ def codex_units():
     for path in CODEX_DIR.rglob("rollout-*.jsonl"):
         st = path.stat()
 
-        def load(path=path):
-            meta, conv, model = _codex_load(path)
-            if meta.get("thread_source") == "subagent":
-                return None, None, None  # subagent thread: agent-to-agent, skip
-            return _routed_mem_dir(meta.get("cwd", "")), conv, model
-
-        yield {"sid": f"codex:{path.stem}", "runtime": "codex", "label": path.stem,
-               "mt": st.st_mtime, "growth_path": path, "load": load}
+        unit = {"sid": f"codex:{path.stem}", "runtime": "codex", "label": path.stem,
+                "mt": st.st_mtime, "growth_path": path}
+        def load(path=path, unit=unit):
+            with bound_file_capture(path, 'codex', unit['sid'], _routed_mem_dir,
+                    lambda cwd: PROJECTS/encode_project_dir(cwd),
+                    projector=lambda records: _codex_load(path, records), bind_turns=True) as bound:
+                meta, conv, model = bound.projection
+                if codex_secondary_session(meta):
+                    return None, None, None
+                unit['capture_sources'] = current_capture_sources()
+                unit['turn_index'] = bound.turn_index
+                return bound.memory_dir, conv, model
+        unit['load'] = load
+        yield unit
 
 
 HERMES_DB = Path.home() / ".hermes" / "state.db"
@@ -653,37 +826,50 @@ def hermes_units():
     finally:
         db.close()
     for sid, model, cwd, mt, n_msgs in rows:
-        def load(sid=sid, model=model, cwd=cwd):
-            db = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True)
+        unit = {"sid": f"hermes:{sid}", "runtime": "hermes", "label": f"hermes-{sid[:8]}",
+                "mt": mt or 0, "growth": n_msgs}
+
+        def load(sid=sid, unit=unit, model=model):
+            db = sqlite3.connect(HERMES_DB.resolve().as_uri() + '?mode=ro', uri=True)
             try:
-                msgs = db.execute(
-                    "SELECT role, content FROM messages WHERE session_id = ? "
-                    "AND role IN ('user','assistant') AND content IS NOT NULL "
-                    "ORDER BY timestamp", (sid,)).fetchall()
+                def route(cwd):
+                    return (_routed_mem_dir(cwd) if cwd else None) or canonical_memory_dir(HERMES_MEM_DIR)
+
+                def candidates():
+                    current = db.execute('SELECT cwd FROM sessions WHERE id=?', (sid,)).fetchone()
+                    destination = route(current[0] or '')
+                    rows = db.execute('SELECT DISTINCT cwd FROM sessions').fetchall()
+                    return [row[0] for row in rows if route(row[0] or '') == destination]
+
+                def project(messages):
+                    parts = []; total = 0
+                    for message in messages:
+                        role, content = message.get('role'), message.get('content')
+                        if role in ('user', 'assistant') and content and content.strip():
+                            total += len(content)
+                            if total > 64 * 1024 * 1024:
+                                raise CapturePolicyBlocked('source_projection_limit')
+                            parts.append((role, content))
+                    return _conv(parts)
+
+                with bound_hermes_capture(db, sid, route, project, candidates) as bound:
+                    unit['capture_sources'] = current_capture_sources()
+                    unit['turn_index'] = bound.turn_index
+                    return bound.memory_dir, bound.projection, model or ''
             finally:
                 db.close()
-            # Route by the session's working directory when Hermes recorded one,
-            # so Hermes memories land in the same per-project stores as every
-            # other runtime; cwd-less sessions go to the hermes-agent store.
-            mem_dir = (_routed_mem_dir(cwd) if cwd else None) or canonical_memory_dir(HERMES_MEM_DIR)
-            return (mem_dir,
-                    _conv([(r, c) for r, c in msgs if (c or "").strip()]),
-                    model or "")
 
-        yield {"sid": f"hermes:{sid}", "runtime": "hermes", "label": f"hermes-{sid[:8]}",
-               "mt": mt or 0, "growth": n_msgs, "load": load}
+        unit['load'] = load
+        yield unit
 
 
 OPENCLAW_DIR = Path.home() / ".openclaw" / "agents"
 
 
-def _openclaw_load(path: Path):
+def _openclaw_load(path: Path, records=None):
     cwd, messages, model = "", [], ""
-    for line in path.read_text(errors="ignore").splitlines():
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
+    projected_chars = 0
+    for d in records if records is not None else _jsonl_records(path):
         t = d.get("type")
         if t == "session":
             cwd = d.get("cwd", "")
@@ -697,6 +883,9 @@ def _openclaw_load(path: Path):
             text = " ".join(c.get("text", "") for c in m.get("content") or []
                             if isinstance(c, dict) and c.get("text"))
             if text.strip():
+                projected_chars += len(text)
+                if projected_chars > 64 * 1024 * 1024:
+                    raise CapturePolicyBlocked('projection_size_limit')
                 messages.append((role, text))
     return cwd, _conv(messages), model
 
@@ -709,12 +898,18 @@ def openclaw_units():
             continue
         st = path.stat()
 
-        def load(path=path):
-            cwd, conv, model = _openclaw_load(path)
-            return _routed_mem_dir(cwd), conv, model
-
-        yield {"sid": f"openclaw:{path.stem}", "runtime": "openclaw", "label": path.stem,
-               "mt": st.st_mtime, "growth_path": path, "load": load}
+        unit = {"sid": f"openclaw:{path.stem}", "runtime": "openclaw", "label": path.stem,
+                "mt": st.st_mtime, "growth_path": path}
+        def load(path=path, unit=unit):
+            with bound_file_capture(path, 'openclaw', unit['sid'], _routed_mem_dir,
+                    lambda cwd: PROJECTS/encode_project_dir(cwd),
+                    projector=lambda records: _openclaw_load(path, records), bind_turns=True) as bound:
+                _cwd, conv, model = bound.projection
+                unit['capture_sources'] = current_capture_sources()
+                unit['turn_index'] = bound.turn_index
+                return bound.memory_dir, conv, model
+        unit['load'] = load
+        yield unit
 
 
 ADAPTERS = {"codex": codex_units, "hermes": hermes_units, "openclaw": openclaw_units}
@@ -727,6 +922,7 @@ ADAPTERS = {"codex": codex_units, "hermes": hermes_units, "openclaw": openclaw_u
 ADAPTER_BACKFILL_DAYS = int(os.environ.get("ENGRAM_ADAPTER_BACKFILL_DAYS", "14"))
 
 
+@checked_capture_call
 def call_api(model, system, user_block):
     import anthropic
     client = anthropic.Anthropic()
@@ -865,6 +1061,7 @@ def parse_cli_output(driver: str, returncode: int, stdout: str, stderr: str, las
     return items
 
 
+@checked_capture_call
 def call_cli(driver, model, system, user_block, timeout=600):
     return parse_cli_output(driver, *run_cli(driver, model, system, user_block, timeout))
 
@@ -877,6 +1074,7 @@ def cli_preflight(driver: str, model: str = "") -> None:
         raise CliBackendError(f"{driver} preflight returned {len(items)} memories, expected none")
 
 
+@checked_capture_call
 def call_ollama(url, model, think, system, user_block, timeout=600, temperature=0.2,
                 num_ctx=32768, num_predict=None, fmt=None):
     # Context overflow is SILENT and catastrophic here. Ollama truncates from the
@@ -930,8 +1128,9 @@ def call_ollama(url, model, think, system, user_block, timeout=600, temperature=
     return data.get("message", {}).get("content", "")
 
 
+@checked_capture_call
 def call_openai(base_url, model, system, user_block, timeout=600, temperature=0.2,
-                response_schema=None, response_name="response", max_tokens=None):
+                response_schema=None, response_name="response", max_tokens=None, request_id=None):
     """OpenAI-compatible chat-completions backend (e.g. the operator's gateway
     at http://127.0.0.1:8790/v1, where `model` is a lane id).
     Mirrors call_ollama's hard SIGALRM deadline so a slow-trickle frontier
@@ -957,6 +1156,8 @@ def call_openai(base_url, model, system, user_block, timeout=600, temperature=0.
             },
         }
     headers = {"Content-Type": "application/json"}
+    if request_id:
+        headers['X-Request-Id'] = request_id
     bearer = os.environ.get("LEYLINE_TOKEN") or os.environ.get("OPENAI_API_KEY")
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
@@ -983,25 +1184,64 @@ def call_openai(base_url, model, system, user_block, timeout=600, temperature=0.
 
 
 def extract_session(cfg, jsonl: Path, mem_dir: Path, dry: bool):  # branch-divergence: intentional — guard clauses below each `return 0, []` (session skipped, no memory written); cfg/dry/mem_dir legitimately N/A on early-exit paths
-    convs = ClaudeCodeHistoryParser().parse(jsonl)
-    if not convs:
-        return 0, []
-    return extract_conv(cfg, convs[0], jsonl.stem, mem_dir, source_model(jsonl),
-                        cfg.get("runtime", "claude-code"), dry)
+    runtime = cfg.get('runtime', 'claude-code')
+    with bound_file_capture(jsonl, runtime, jsonl.stem, mem_dir, jsonl.parent, bind_turns=True) as bound:
+        convs = ClaudeCodeHistoryParser().parse(bound.snapshot)
+        if not convs:
+            return 0, []
+        bound.turn_index.seal(bound.source, convs[0])
+        return extract_conv(cfg, convs[0], jsonl.stem, bound.memory_dir, source_model(bound.snapshot), runtime, dry)
 
 
-def extract_conv(cfg, conv, session_id, mem_dir, model_hint, runtime, dry):  # branch-divergence: intentional — same guard-clause shape as extract_session: each `return 0, []` is a skipped session, params legitimately N/A
+def parse_response_items(raw, transcript):
+    raw = (raw or "").strip()
+    raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.M).strip()
+    arr = re.search(r"\[.*\]", raw, flags=re.S)
+    if arr:
+        raw = arr.group(0)
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"model returned unparseable JSON ({e}); first 200 chars: {raw[:200]!r}")
+    if not isinstance(items, list):
+        raise ValueError(f"model returned {type(items).__name__}, expected a JSON array")
+    validate_items(items, transcript)
+    return items
+
+
+@checked_capture_call
+def extract_conv(cfg, conv, session_id, mem_dir, model_hint, runtime, dry, *, replay=None):  # branch-divergence: intentional — same guard-clause shape as extract_session: each `return 0, []` is a skipped session, params legitimately N/A
     # The cli backend also refuses its own extraction calls, should one ever be persisted.
     if (is_agent_session(conv, CLI_SELF_SIGNATURES) if cfg["backend"] == "cli" else is_agent_session(conv)):
         return 0, []  # automated agent/heartbeat run — skip, no model call
     transcript = build_transcript(conv, envelopes=False) if cfg["backend"] == "cli" else build_transcript(conv)
     if len(transcript) < 200:
         return 0, []
+    if replay is not None:
+        if dry:
+            raise ValueError('isolated replay requires its explicit effect mode')
+        return replay.process(adapter='primary', cfg=cfg, renderer=replay.notes.renderer, transcript=transcript,
+            session_id=session_id, mem_dir=mem_dir, runtime=runtime, persona=cfg.get('persona', PERSONA), model_hint=model_hint)
+    existing = existing_memory_context(mem_dir)
     user_block = (
-        f"EXISTING MEMORIES FOR THIS PROJECT:\n{existing_memory_context(mem_dir)}\n\n"
+        f"EXISTING MEMORIES FOR THIS PROJECT:\n{existing}\n\n"
         f"SESSION TRANSCRIPT:\n{transcript}"
     )
-    if cfg["backend"] == "ollama":
+    qwen_result, qwen_state = None, None
+    actual_extractor_model = cfg.get('model', '')
+    profile = cfg.get('source_id_profile')
+    if profile and cfg['backend'] == 'openai':
+        from qualified_qwen import extract_qualified
+        complete_transcript = build_transcript(conv, complete=True)
+        qwen_result, qwen_state = extract_qualified(profile, runtime, complete_transcript, existing, session_id,
+            PROJECT_NAMES, validate_items, STATE_DIR / 'source-id-runs')
+    if qwen_result is not None and qwen_result.items is not None:
+        transcript = build_transcript(conv, source_ids=True, complete=True)
+        if transcript != complete_transcript:
+            raise RuntimeError('source-ID transcript changed before provenance binding')
+        raw = json.dumps(qwen_result.items)
+        actual_extractor_model = qwen_result.model
+    elif cfg["backend"] == "ollama":
         nctx, tmo, est = size_request(SYSTEM_PROMPT, user_block,
                                       cfg.get("num_ctx", 32768))
         print(f"    {session_id[:8]}: ~{est:,.0f} tok -> num_ctx={nctx:,} timeout={tmo}s",
@@ -1031,32 +1271,33 @@ def extract_conv(cfg, conv, session_id, mem_dir, model_hint, runtime, dry):  # b
                 print(f"  WARN {session_id[:8]}: reply failed validation ({e}); retrying once", file=sys.stderr)
     else:
         raw = call_api(cfg["model"], SYSTEM_PROMPT, user_block)
-    raw = (raw or "").strip()
-    # gpt-oss may wrap JSON in prose/code fences; grab the array
-    raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.M).strip()
-    arr = re.search(r"\[.*\]", raw, flags=re.S)
-    if arr:
-        raw = arr.group(0)
     # A model that returns unparseable output is a FAILURE, not an empty result.
     # Returning (0, []) here used to let main() stamp state.json for the session,
     # permanently retiring it unextracted. Raise instead, so it takes the same
     # retry path as an API error and gets picked up on the next run.
-    try:
-        items = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"model returned unparseable JSON ({e}); first 200 chars: {raw[:200]!r}")
-    if not isinstance(items, list):
-        raise ValueError(f"model returned {type(items).__name__}, expected a JSON array")
-    validate_items(items, transcript)
+    items = parse_response_items(raw, transcript)
     if cfg["backend"] == "openai" and os.environ.get("ENGRAM_SUPPORT_CHECK", "1") != "0" and not dry:
-        # The judge that qualified on docs/SUPPORT_JUDGE_GATE_2026-10-15.json, on the same lane.
+        # Existing lane annotation. Historical gates do not qualify this revised
+        # extraction prompt or its future evidence distribution.
         base_url = cfg.get("base_url", "http://127.0.0.1:8790/v1")
-        chat = lambda system, user: call_openai(base_url, cfg["model"], system, user, timeout=180,
-                                                temperature=0.0)
+        def chat(system, user):
+            request_id = None
+            if qwen_result is not None and qwen_result.items is not None:
+                import uuid
+                from qualified_qwen import record_event
+                require_capture_allowed()
+                request_id = 'engram-source-id-support-' + uuid.uuid4().hex
+                record_event(qwen_state, 'support_request_started', request_id=request_id, model_alias=cfg['model'])
+            response = call_openai(base_url, cfg['model'], system, user, timeout=180,
+                                   temperature=0.0, **({'request_id': request_id} if request_id else {}))
+            if request_id:
+                record_event(qwen_state, 'support_request_finished', request_id=request_id, model_alias=cfg['model'])
+            return response
         for it in items:
             it["support"] = support_check.check(chat, it["description"], it["body"], it["passages"])
     prov = {
-        "extractor_model": cfg.get("model", ""),
+        "extractor_model": actual_extractor_model,
+        "extractor_profile": profile.get('id') if qwen_result is not None and qwen_result.items is not None else None,
         "runtime": runtime,
         "persona": cfg.get("persona", PERSONA),
         "model": model_hint,
@@ -1071,8 +1312,14 @@ def extract_conv(cfg, conv, session_id, mem_dir, model_hint, runtime, dry):  # b
             sup = f"  supersedes={it['supersedes']}" if it.get("supersedes") else ""
             written.append(f"[{it['type']}] {it['slug']}: {it['description']}{sup}")
         else:
-            written.append(str(write_memory(
-                mem_dir, it, source_session=session_id, provenance=prov)))
+            path = write_memory(mem_dir, it, source_session=session_id, provenance=prov)
+            written.append(str(path))
+            if qwen_result is not None and qwen_result.items is not None:
+                from qualified_qwen import note_written
+                note_written(qwen_state, path)
+    if qwen_result is not None and qwen_result.items is not None:
+        from qualified_qwen import record_event
+        record_event(qwen_state, 'batch_dry_run' if dry else 'batch_persisted', notes=len(written))
     return len(written), written
 
 
@@ -1130,6 +1377,9 @@ def main():
            "think": args.think, "ollama_url": args.ollama_url, "base_url": args.base_url,
            "num_ctx": args.num_ctx,
            "runtime": args.runtime, "persona": args.persona}
+    if args.backend == 'openai':
+        from qualified_qwen import load_active_profile
+        cfg['source_id_profile'] = load_active_profile()
     state = load_state()
 
     cutoff = None
@@ -1173,9 +1423,14 @@ def main():
 
     total_mem = 0
     errors = 0
+    blocked = 0
     for jsonl, mem_dir, mt in sessions:
         try:
             n, written = extract_session(cfg, jsonl, mem_dir, args.dry_run)
+        except CapturePolicyBlocked as e:
+            blocked += 1
+            print(f"capture deferred: {e.reason}", file=sys.stderr)
+            continue  # no processed watermark or failure payload
         except Exception as e:
             errors += 1
             print(f"ERROR {jsonl.name}: {e}", file=sys.stderr)
@@ -1236,15 +1491,28 @@ def main():
     for unit in adapter_units:
         try:
             mem_dir, conv, src_model = unit["load"]()
+            turn_index = unit.pop('turn_index', None)
             if mem_dir is None or conv is None or not conv.messages:
                 n, written = 0, []  # subagent thread / excluded project / empty
             else:
-                n, written = extract_conv(cfg, conv, unit["sid"], mem_dir,
-                                          src_model, unit["runtime"], args.dry_run)
+                sources = unit.get('capture_sources')
+                if sources:
+                    with capture_scope(sources), source_turn_scope(turn_index):
+                        n, written = extract_conv(cfg, conv, unit["sid"], mem_dir, src_model, unit["runtime"], args.dry_run)
+                else:
+                    with source_turn_scope(None):
+                        n, written = extract_conv(cfg, conv, unit["sid"], mem_dir, src_model, unit["runtime"], args.dry_run)
+        except CapturePolicyBlocked as e:
+            blocked += 1
+            print(f"capture deferred: {e.reason}", file=sys.stderr)
+            continue
         except Exception as e:
             errors += 1
             print(f"ERROR {unit['sid']}: {e}", file=sys.stderr)
             continue
+        finally:
+            unit.pop('turn_index', None)
+            turn_index = None
         total_mem += n
         if n:
             tag = "[dry] " if args.dry_run else ""
@@ -1265,7 +1533,7 @@ def main():
 
     n_sessions = len(sessions) + len(adapter_units)
     print(f"\n{'[dry-run] ' if args.dry_run else ''}sessions={n_sessions} "
-          f"memories={total_mem} errors={errors}")
+          f"memories={total_mem} errors={errors} policy_deferred={blocked}")
 
     # Exit 0 on a genuinely quiet run (sessions processed, nothing qualified) but
     # NONZERO when work was attempted, nothing came out, and something errored.

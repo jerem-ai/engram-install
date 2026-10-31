@@ -224,14 +224,6 @@ if [ -r "$SCRIPT_DIR/note_claims.py" ] \
   "$PY" "$SCRIPT_DIR/note_claims.py" --limit "${ENGRAM_NOTE_CLAIMS_CALLS:-40}" \
     || echo "[$(date '+%F %T')] WARN: note claims exited $?"
 fi
-# Per-claim review (October 20, OBSERVE.md 15f): a verdict for each typed claim, judged on
-# its own passages, appended to claim-verdicts.jsonl (the hourly archive job copies it to
-# the mini). Same lanes as the backfill; ENGRAM_CLAIM_REVIEW=off disables it. Capped at
-# ENGRAM_CLAIM_REVIEW_CALLS model calls a run; a failure never fails extraction.
-CLAIM_REVIEW="${ENGRAM_CLAIM_REVIEW:-}"
-if [ -r "$SCRIPT_DIR/review_claims.py" ] \
-    && { [ "$CLAIM_REVIEW" = on ] || { [ -z "$CLAIM_REVIEW" ] && [ "$BACKEND" = openai ]; }; }; then
-  "$PY" "$SCRIPT_DIR/review_claims.py" --limit "${ENGRAM_CLAIM_REVIEW_CALLS:-120}" \
-    || echo "[$(date '+%F %T')] WARN: claim review exited $?"
-fi
+# Per-claim review (OBSERVE.md 15f) runs on its own nightly job since October 23,
+# extraction/run-claim-review.sh on Qwen3.8 on TARS, so an Opus outage here cannot stop it.
 echo "[$(date '+%F %T')] memory-extraction done"
